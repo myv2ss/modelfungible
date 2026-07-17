@@ -24,3 +24,6 @@ __all__ = [
     "OllamaAdapter",
     "VertexAIAdapter",
 ]
+from modelfungible.enterprise.audit import (
+    AuditLogger, PIIDetector, ComplianceStamper, RetentionPolicy
+)
