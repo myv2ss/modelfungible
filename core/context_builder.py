@@ -1,30 +1,35 @@
-# Copyright (c) 2026 Saabu / OpenClaw. All rights reserved.
-# BUSL-1.0 License — see LICENSE file for details.
-
+#!/usr/bin/env python3
 """
-ContextBuilder — ModelFungible Core
+Context Builder — ModelFungible
 
-Builds a structured context packet from any structured data source.
-Domain-agnostic — works with legal, healthcare, finance, HR, or any structured data.
+Aggregates all relevant context from shared state into a single packet.
+One computation per cycle. Shared by all models.
+
+Context = {
+    market:    regime, VIX, SPY vs MA200, risk flags
+    positions: open positions with live P&L
+    risk_flags: active warnings
+    sizing:    from facts
+    facts_version: timestamp for staleness checks
+}
 """
 from __future__ import annotations
 import json
-from datetime import datetime
+from datetime import datetime, date
 from pathlib import Path
-from typing import Any, Optional
+from modelfungible.enterprise.audit import AuditLogger, PIIDetector
+from typing import Optional
 
 
-def load_json(path, default=None):
-    if path is None:
-        return default if default is not None else {}
+def load_json(path: str | Path, default=None):
     try:
         with open(path) as f:
             return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError, TypeError):
+    except (FileNotFoundError, json.JSONDecodeError):
         return default if default is not None else {}
 
 
-def load_text(path, default=""):
+def load_text(path: str | Path, default: str = "") -> str:
     try:
         with open(path) as f:
             return f.read().strip()
@@ -32,294 +37,256 @@ def load_text(path, default=""):
         return default
 
 
+# ─────────────────────────────────────────────────────────────────
+# ContextPacket
+# ─────────────────────────────────────────────────────────────────
 class ContextPacket:
-    """
-    A structured context bundle for any domain.
-
-    Fields (all optional):
-        role:          "scanner" | "monitor" | "analyst" | "custom"
-        model:         model hint
-        generated_at:  ISO timestamp
-        context:       **DOMAIN-AGNOSTIC** — any structured dict
-        market:        optional trading market data (backward compat)
-        positions:      optional positions (backward compat)
-        risk_flags:     optional risk flags (backward compat)
-        sizing:         domain-specific sizing
-        pending:        tasks still to do in session
-        strategy_rules: relevant strategy rule definitions
-        today_memory:   today's session notes
-        long_term_mem:  long-term memory
-        facts_version:  version timestamp of facts for staleness detection
-    """
+    """A bundle of all context relevant to a strategy decision."""
 
     def __init__(self, **kwargs):
-        self.role = kwargs.get("role", "analyst")
-        self.model = kwargs.get("model", "auto")
-        self.generated_at = kwargs.get("generated_at") or datetime.now().isoformat()
-        self.context = kwargs.get("context", {})
-        self.market = kwargs.get("market", {})
-        self.positions = kwargs.get("positions", [])
-        self.risk_flags = kwargs.get("risk_flags", {})
-        self.sizing = kwargs.get("sizing", {})
-        self.pending = kwargs.get("pending", [])
+        self.role          = kwargs.get("role", "scanner")
+        self.model         = kwargs.get("model", "auto")
+        self.generated_at  = kwargs.get("generated_at", datetime.now().isoformat())
+        self.market        = kwargs.get("market", {})      # regime, vix, spy, etc.
+        self.positions     = kwargs.get("positions", [])
+        self.risk_flags   = kwargs.get("risk_flags", {})
+        self.sizing       = kwargs.get("sizing", {})
+        self.pending       = kwargs.get("pending", [])      # tasks still to do
         self.strategy_rules = kwargs.get("strategy_rules", {})
-        self.today_memory = kwargs.get("today_memory", "")
+        self.today_memory  = kwargs.get("today_memory", "")
         self.long_term_mem = kwargs.get("long_term_mem", "")
-        # facts_version falls back to generated_at for backward compat
-        fv = kwargs.get("facts_version")
-        ga = kwargs.get("generated_at")
-        self.facts_version = fv if fv is not None else (ga if ga else "")
+        self.facts_version = kwargs.get("facts_version", "")
+        self._extra        = kwargs.get("_extra", {})
 
-    def context_summary(self) -> str:
-        if self.context:
-            keys = list(self.context.keys())[:5]
-            return "Context keys: " + ", ".join(keys)
-        if self.market:
-            m = self.market
-            reg = str(m.get("regime", "?"))
-            vix = str(m.get("vix", "?"))
-            spy = str(m.get("spy", "?"))
-            return "Regime: " + reg + " | VIX: " + vix + " | SPY: $" + spy
-        return "No context data"
-
-    def open_tickers(self) -> str:
-        if not self.positions:
-            return "None"
-        return ", ".join(str(p.get("ticker", "?")) for p in self.positions)
-
-    def positions_summary(self) -> str:
-        if not self.positions:
-            return "No open positions."
-        parts = []
-        for p in self.positions:
-            ticker = str(p.get("ticker", "?"))
-            direction = str(p.get("direction", "?"))
-            pnl_pct = p.get("pnl_pct", 0)
-            pnl_dollar = p.get("pnl_dollar", 0)
-            entry = p.get("entry", 0)
-            current = p.get("current", 0)
-            pct_sign = "+" if pnl_pct >= 0 else ""
-            dol_sign = "+" if pnl_dollar >= 0 else ""
-            parts.append(
-                ticker + ": " + direction + " | Entry: $" +
-                str(round(entry, 2)) + " -> $" + str(round(current, 2)) +
-                " | P&L: " + pct_sign + str(round(pnl_pct, 1)) + "% (" +
-                dol_sign + "$" + str(round(pnl_dollar)) + ")"
-            )
-        return "\n".join(parts)
-
-    def risk_summary(self) -> str:
-        if not self.risk_flags:
-            return "No active risk flags."
-        active = [k for k, v in self.risk_flags.items() if v]
-        if not active:
-            return "None"
-        flags_str = ", ".join("[" + str(f) + "]" for f in active)
-        return "Active risk flags: " + flags_str
+    # ── Formatting helpers ─────────────────────────────────────
 
     def market_summary(self) -> str:
+        """Human-readable one-line market state."""
         m = self.market
-        if not m:
-            return "No market data"
-        reg = str(m.get("regime", "?"))
-        vix = str(m.get("vix", "?"))
-        vix_reg = str(m.get("vix_regime", "?"))
-        spy = str(m.get("spy", "?"))
-        ma200 = str(m.get("spy_ma200", "?"))
-        dist = round(m.get("spy_ma200_dist", 0), 2)
-        dist_sign = "+" if dist >= 0 else ""
         return (
-            "Regime: " + reg +
-            " | VIX: " + vix + " (" + vix_reg + ")" +
-            " | SPY: $" + spy + " (MA200: $" + ma200 + ", " + dist_sign + str(dist) + "%)"
+            "Regime: {r} | VIX: {v} ({vreg}) | "
+            "SPY: ${s} (MA200: ${m2}, {d:+.2f}%)".format(
+                r=m.get("regime", "?"),
+                v=m.get("vix", "?"),
+                vreg=m.get("vix_regime", "?"),
+                s=m.get("spy", "?"),
+                m2=m.get("spy_ma200", "?"),
+                d=m.get("spy_ma200_dist", 0),
+            )
         )
 
+    def positions_summary(self) -> str:
+        """Human-readable list of open positions with P&L."""
+        if not self.positions:
+            return "  No open positions."
+        lines = []
+        for p in self.positions:
+            pnl_pct = p.get("pnl_pct", 0)
+            pnl_dol = p.get("pnl_dollar", 0)
+            sgn = "+" if pnl_pct >= 0 else ""
+            lines.append(
+                "  {t} {d}: {s}{p:.1f}% (${n:+.0f}) @ ${c}".format(
+                    t=p.get("ticker", "?"),
+                    d=p.get("direction", "L")[0],
+                    s=sgn, p=pnl_pct,
+                    n=pnl_dol,
+                    c=p.get("current", "?"),
+                )
+            )
+        return "\n".join(lines)
+
+    def open_tickers(self) -> str:
+        """Comma-separated list of open tickers."""
+        if not self.positions:
+            return "None"
+        return ", ".join(p["ticker"] for p in self.positions)
+
+    def risk_summary(self) -> str:
+        """Active risk flags as pipe-separated string."""
+        active = [
+            k for k, v in (self.risk_flags or {}).items()
+            if v
+        ]
+        return " | ".join(active) if active else "None"
+
     def to_dict(self) -> dict:
-        return {
-            "role": self.role,
-            "model": self.model,
-            "generated_at": self.generated_at,
-            "context": self.context,
-            "market": self.market,
-            "positions": self.positions,
-            "risk_flags": self.risk_flags,
-            "sizing": self.sizing,
-            "pending": self.pending,
-            "facts_version": self.facts_version,
-        }
+        """Serialize to dict."""
+        return vars(self)
 
 
+# ─────────────────────────────────────────────────────────────────
+# ContextBuilder
+# ─────────────────────────────────────────────────────────────────
 class ContextBuilder:
     """
-    Builds ContextPacket from any structured data source.
+    Builds a ContextPacket from shared state files.
 
-    Usage:
-        cb = ContextBuilder(facts_file="my_context.json")
-        ctx = cb.build(role="analyst")
-
-        cb = ContextBuilder()
-        ctx = cb.build(role="analyst", domain_data={"contracts": [...], "jurisdiction": "NY"})
-        prompt = cb.build_prompt(ctx, "my_strategy", rules)
+    Example:
+        cb = ContextBuilder(
+            facts_file="trading_desk_state.json",
+            memory_dir="./memory"
+        )
+        ctx = cb.build(role="scanner", strategy="EQM")
+        print(ctx.market_summary())
+        print(ctx.open_tickers())
     """
 
-    def __init__(self, facts_file: Optional[str] = None, memory_dir: Optional[str] = None):
+    def __init__(
+        self,
+        facts_file: str | Path | None = None,
+        memory_dir: str | Path | None = None,
+        audit_logger: AuditLogger | None = None,
+    ):
         self.facts_file = facts_file
-        self.memory_dir = Path(memory_dir) if memory_dir else None
-        self._facts = load_json(facts_file, {})
+        self.memory_dir  = Path(memory_dir) if memory_dir else None
+        self._audit = audit_logger
+        self._pii = PIIDetector() if audit_logger else None
+
+    def set_audit_logger(self, logger: AuditLogger) -> None:
+        """Attach an audit logger after construction."""
+        self._audit = logger
+        self._pii = PIIDetector()
+
+    def _maybe_audit(self, action, outcome, context_summary=None, **extra):
+        if self._audit is None:
+            return
+        try:
+            pii_flags = list(self._pii.scan(context_summary)) if (self._pii and context_summary) else []
+            safe_ctx = self._pii.redact(context_summary) if (self._pii and context_summary) else (context_summary or {})
+            self._audit.log(action=action, actor="context_builder", outcome=outcome,
+                            context=safe_ctx, pii_detected=pii_flags,
+                            metadata={k: v for k, v in extra.items() if v})
+        except Exception:
+            pass
 
     def build(
         self,
-        role: str = "analyst",
-        domain_data: Optional[dict] = None,
-        **extra,
+        role: str = "scanner",
+        model: str = "auto",
+        strategy: str | None = None,
+        org_id: str = "",
     ) -> ContextPacket:
-        context_data = domain_data if domain_data is not None else self._facts.get("context", {})
-        return ContextPacket(
+        """
+        Build and return a ContextPacket.
+
+        Args:
+            role:      what this context will be used for (scanner/monitor/analyst)
+            model:     which model will consume this context
+            strategy:  optional strategy ID (currently unused, for future routing)
+
+        Returns:
+            ContextPacket
+        """
+        facts = load_json(self.facts_file, {}) if self.facts_file else {}
+
+        # Load today's memory
+        today_str = date.today().isoformat()
+        mem_today = ""
+        mem_long  = ""
+        if self.memory_dir:
+            mem_today = load_text(
+                self.memory_dir / f"{today_str}.md", ""
+            )
+            mem_long  = load_text(
+                self.memory_dir / "MEMORY.md", ""
+            )
+
+        result = ContextPacket(
             role=role,
-            model=self._facts.get("model", "auto"),
-            generated_at=self._facts.get("generated_at", datetime.now().isoformat()),
-            context=context_data,
-            market=self._facts.get("market", {}),
-            positions=self._facts.get("positions", []),
-            risk_flags=self._facts.get("risk_flags", {}),
-            sizing=self._facts.get("sizing", {}),
-            pending=self._facts.get("pending", []),
-            strategy_rules=self._facts.get("strategy_rules", {}),
-            today_memory=self._load_today_memory(),
-            long_term_mem=self._facts.get("long_term_memory", ""),
-            facts_version=self._facts.get("facts_version") or self._facts.get("generated_at") or "",
+            model=model,
+            generated_at=datetime.now().isoformat(),
+            market=facts.get("market", {}),
+            positions=facts.get("positions", []),
+            risk_flags=facts.get("risk_flags", {}),
+            sizing=facts.get("sizing", {}),
+            pending=facts.get("pending", []),
+            strategy_rules={},        # Filled by caller if strategy passed
+            today_memory=mem_today,
+            long_term_mem=mem_long,
+            facts_version=facts.get("generated_at", ""),
         )
+        safe_summary = dict(facts)
+        if org_id:
+            safe_summary["org_id"] = org_id
+        self._maybe_audit(action="context_build", outcome="success",
+                           context_summary=safe_summary, domain=role,
+                           facts_file=str(self.facts_file) if self.facts_file else "")
+        return result
 
-    def _load_today_memory(self) -> str:
-        if not self.memory_dir:
-            return ""
-        today = datetime.now().strftime("%Y-%m-%d")
-        path = self.memory_dir / (today + ".md")
-        return load_text(path)
-
-    def build_prompt(
+    def build_scanner_prompt(
         self,
-        ctx: ContextPacket,
-        strategy_id: str,
+        packet: ContextPacket,
+        strategy_name: str,
         strategy_rules: dict,
     ) -> str:
-        role_instr = self._role_instruction(ctx.role)
-        strat_block = self._format_strategy(strategy_id, strategy_rules)
-        ctx_block = self._format_context(ctx)
-        schema_block = self._format_output_schema(
-            strategy_rules.get("signal_output_schema", {})
-        )
-        parts = [
-            "You are a " + ctx.role + " using ModelFungible.",
+        """
+        Build a formatted prompt from a context packet and strategy rules.
+
+        Args:
+            packet:          ContextPacket from build()
+            strategy_name:   name of strategy (e.g. "EQM")
+            strategy_rules:   strategy dict from RulesEngine
+
+        Returns:
+            Formatted prompt string
+        """
+        # Sizing table
+        sizing_raw = strategy_rules.get("sizing", {})
+        sizing_lines = []
+        for regime, cfg in sizing_raw.items():
+            if isinstance(cfg, dict):
+                sizing_lines.append(
+                    f"  {regime}: ${cfg.get('amount','?')} "
+                    f"(max {cfg.get('max_positions','?')} positions)"
+                )
+            else:
+                sizing_lines.append(f"  {regime}: {cfg}")
+        sizing_txt = "\n".join(sizing_lines) if sizing_lines else "  See rules."
+
+        # Stop/target
+        exit_rules = strategy_rules.get("exit", [])
+        stop_txt  = "See rules."
+        target_txt = "See rules."
+        for rule in exit_rules:
+            if rule.get("type") in ("stop_loss", "trailing_stop"):
+                stop_txt = f"{rule.get('pct', '?')}%"
+            elif rule.get("type") == "gain":
+                target_txt = f"+{rule.get('pct', rule.get('gain_pct','?'))}%"
+
+        prompt = "\n".join([
+            "You are a trading signal scanner. Output ONLY valid JSON.",
             "",
-            role_instr,
+            f"## MARKET STATE (facts.json, {packet.facts_version[:19] if packet.facts_version else 'unknown'})",
+            packet.market_summary(),
             "",
-            strat_block,
+            "## OPEN POSITIONS -- DO NOT RE-SIGNAL THESE",
+            packet.open_tickers(),
+            packet.positions_summary(),
             "",
-            ctx_block,
+            "## STRATEGY: {}".format(strategy_name),
+            "## RULES",
+            "  Entry trigger: {}".format(
+                strategy_rules.get("entry_trigger", "N/A")
+            ),
+            "  Sizing:",
+            sizing_txt,
+            "  Stop: {}%".format(stop_txt),
+            "  Target: {}".format(target_txt),
             "",
-            schema_block,
+            "## YOUR TASK",
+            "1. Read the rules above",
+            "2. Apply entry/exit/sizing rules mechanically",
+            "3. Output ONLY valid JSON matching this schema:",
+            json.dumps(strategy_rules.get("signal_output_schema", {}), indent=2),
             "",
-            "Respond ONLY with valid JSON matching the schema above. No extra text.",
-        ]
-        return "\n".join(parts)
-
-    def build_scanner_prompt(self, ctx, strategy_id, strategy_rules) -> str:
-        return self.build_prompt(ctx, strategy_id, strategy_rules)
-
-    def build_monitor_prompt(self, ctx, strategy_id, strategy_rules) -> str:
-        return self.build_prompt(ctx, strategy_id, strategy_rules)
-
-    def _role_instruction(self, role: str) -> str:
-        mapping = {
-            "scanner": "You scan structured data and identify actionable items based on the strategy rules.",
-            "monitor": "You continuously monitor data and flag changes that match strategy triggers.",
-            "analyst": "You analyze structured data and produce decisions based on the strategy rules.",
-            "custom": "You follow the strategy rules provided to analyze context and produce a decision.",
-        }
-        return mapping.get(role, "You are a " + role + " following the strategy rules provided.")
-
-    def _format_strategy(self, strategy_id: str, rules: dict) -> str:
-        lines = [
-            "## Strategy: " + rules.get("name", strategy_id),
-            rules.get("description", ""),
-            "",
-            "### Entry Trigger",
-            "`" + rules.get("entry_trigger", "none") + "`",
-            "",
-            "### Sizing",
-        ]
-        sizing = rules.get("sizing", {})
-        if sizing:
-            for regime, config in sizing.items():
-                lines.append("  [" + regime + "]: " + str(config))
-        else:
-            lines.append("  (no sizing rules)")
-        exits = rules.get("exit", [])
-        if exits:
-            lines.append("")
-            lines.append("### Exit Rules")
-            for ex in exits:
-                lines.append("  - " + str(ex))
-        return "\n".join(lines)
-
-    def _format_context(self, ctx: ContextPacket) -> str:
-        lines = ["## Context Data"]
-
-        if ctx.context:
-            lines.append("### Domain Data")
-            ctx_str = json.dumps(ctx.context, indent=2, default=str)
-            lines.append(ctx_str[:2000])
-            lines.append("")
-
-        if ctx.market:
-            lines.append("### Market State")
-            m = ctx.market
-            lines.append("- Regime: " + str(m.get("regime", "?")))
-            lines.append("- VIX: " + str(m.get("vix", "?")) + " (" +
-                         str(m.get("vix_regime", "?")) + ")")
-            spy = m.get("spy")
-            if spy:
-                ma200 = str(m.get("spy_ma200", "?"))
-                dist = round(m.get("spy_ma200_dist", 0), 2)
-                dist_sign = "+" if dist >= 0 else ""
-                lines.append("- SPY: $" + str(spy) + " (MA200: $" + ma200 +
-                             ", " + dist_sign + str(dist) + "%)")
-            lines.append("")
-
-        if ctx.positions:
-            lines.append("### Open Positions")
-            for p in ctx.positions:
-                ticker = str(p.get("ticker", "?"))
-                direction = str(p.get("direction", "?"))
-                pnl_pct = p.get("pnl_pct", 0)
-                pnl_sign = "+" if pnl_pct >= 0 else ""
-                lines.append("- " + ticker + ": " + direction +
-                             " | P&L: " + pnl_sign + str(pnl_pct) + "%")
-            lines.append("")
-
-        if ctx.risk_flags:
-            lines.append("### Risk Flags")
-            for flag, active in ctx.risk_flags.items():
-                if active:
-                    lines.append("- [RISK] " + str(flag))
-            lines.append("")
-
-        if ctx.today_memory:
-            lines.append("### Today's Notes\n" + ctx.today_memory[:500])
-
-        if ctx.long_term_mem:
-            lines.append("\n### Long-Term Memory\n" + ctx.long_term_mem[:500])
-
-        return "\n".join(lines)
-
-    def _format_output_schema(self, schema: dict) -> str:
-        if not schema:
-            return "## Output Schema\n{ /* your output schema here */ }"
-        lines = ["## Output Schema (required)"]
-        for field, type_desc in schema.items():
-            lines.append("  " + str(field) + ": " + str(type_desc))
-        return "\n".join(lines)
+            "## OUTPUT",
+            "JSON only. No markdown. No explanation.",
+            '{"ticker": ...',
+        ])
+        return prompt
 
 
-__all__ = ["ContextBuilder", "ContextPacket"]
+# ─────────────────────────────────────────────────────────────────
+# Convenience exports
+# ─────────────────────────────────────────────────────────────────
+__all__ = ["ContextBuilder", "ContextPacket", "load_json", "load_text"]

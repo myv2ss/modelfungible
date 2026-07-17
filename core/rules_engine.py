@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Optional
+from modelfungible.enterprise.audit import AuditLogger, PIIDetector
 
 # ─────────────────────────────────────────────────────────────────
 # Errors
@@ -52,9 +53,28 @@ class RulesEngine:
         "amount", "max_positions"
     }
 
-    def __init__(self, rules_path: str | Path):
+    def __init__(
+        self,
+        rules_path: str | Path,
+        audit_logger: AuditLogger | None = None,
+    ):
         self.path = Path(rules_path)
         self._rules = self._load()
+        self._audit = audit_logger
+
+    def set_audit_logger(self, logger: AuditLogger) -> None:
+        """Attach an audit logger after construction."""
+        self._audit = logger
+
+    def _maybe_audit(self, action, outcome, strategy_id="", errors=None, **extra):
+        if self._audit is None:
+            return
+        try:
+            self._audit.log(action=action, actor="rules_engine",
+                            outcome=outcome, strategy_id=strategy_id,
+                            metadata={"errors": errors or [], **extra})
+        except Exception:
+            pass
 
     # ── Loading ─────────────────────────────────────────────────
 
@@ -81,7 +101,9 @@ class RulesEngine:
     def get(self, strategy_id: str) -> dict:
         """Return raw strategy dict."""
         if strategy_id == "_meta" or strategy_id not in self._rules:
+            self._maybe_audit("strategy_get", "not_found", strategy_id=strategy_id)
             raise StrategyValidationError(f"Strategy '{strategy_id}' not found")
+        self._maybe_audit("strategy_get", "success", strategy_id=strategy_id)
         return self._rules[strategy_id]
 
     def get_raw(self) -> dict:
@@ -101,6 +123,9 @@ class RulesEngine:
             strategy = self.get(strategy_id)
         except StrategyValidationError:
             raise
+        finally:
+            self._maybe_audit("strategy_validate", "attempted", strategy_id=strategy_id,
+                               errors=errors if errors else [])
 
         # Required top-level fields
         for field in self.REQUIRED_FIELDS:

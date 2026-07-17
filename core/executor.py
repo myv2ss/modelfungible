@@ -19,6 +19,7 @@ from modelfungible.adapters.openai import OpenAIAdapter
 from modelfungible.adapters.anthropic import AnthropicAdapter
 from modelfungible.adapters.groq import GroqAdapter
 from modelfungible.core.cost_router import CostRouter, ModelProfile, HealthChecker
+from modelfungible.enterprise.audit import AuditLogger, PIIDetector
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -104,13 +105,19 @@ class ModelExecutor:
         "groq":      GroqAdapter,
     }
 
-    def __init__(self, router_mode: str = "balanced"):
+    def __init__(
+        self,
+        router_mode: str = "balanced",
+        audit_logger: "AuditLogger | None" = None,
+    ):
         self._adapters:    dict[str, BaseAdapter] = {}
         self._models:      dict[str, dict]        = {}   # name → {provider, model_id, profile}
         self._chain:       list[str]              = []
         self._health = HealthChecker()
         self._router_mode = router_mode
         self._profiles: dict[str, ModelProfile] = {}  # name → ModelProfile
+        self._audit: "AuditLogger | None" = audit_logger
+        self._pii = PIIDetector() if audit_logger else None
 
         # Register default adapters
         for name, cls in self._ADAPTERS.items():
@@ -211,6 +218,9 @@ class ModelExecutor:
         Returns:
             ExecutionResult
         """
+        # Store context for audit logging
+        self._last_context = context
+
         chain = fallback_chain or self._chain
         active_mode = router_mode or self._router_mode
 
@@ -233,6 +243,9 @@ class ModelExecutor:
                     temperature, max_tokens, **kwargs
                 )
             else:
+                self._audit_log(action="model_execute", outcome="error",
+                                 model_id="router", error="No healthy models available",
+                                 context=self._last_context)
                 return ExecutionResult(
                     output={},
                     model_id="router",
@@ -255,12 +268,12 @@ class ModelExecutor:
                     temperature, max_tokens, **kwargs
                 )
                 if result.success:
-                    # Record outcome for cost router
-                    self._health.record(
-                        model_name,
-                        success=True,
-                        latency_ms=result.latency_s * 1000,
-                    )
+                    self._health.record(model_name, success=True,
+                                       latency_ms=result.latency_s * 1000)
+                    self._audit_log(action="model_execute", outcome="success",
+                                    model_id=model_name, context=self._last_context,
+                                    latency_s=result.latency_s,
+                                    metadata={"fallback_used": fallback_used} if fallback_used else {})
                     return result
                 last_error = result._error
                 self._health.record(model_name, success=False, latency_ms=0)
@@ -310,31 +323,53 @@ class ModelExecutor:
 
             raw = getattr(output, "_raw", str(output))
             usage = getattr(output, "_usage", None)
-
-            return ExecutionResult(
-                output=output,
-                model_id=model_id,
-                latency_s=round(latency, 3),
-                raw=raw,
-            )
+            latency = round(time.time() - start, 3)
+            self._audit_log(action="model_execute", outcome="success",
+                            model_id=model_id, context=getattr(self, "_last_context", None),
+                            latency_s=latency)
+            return ExecutionResult(output=output, model_id=model_id,
+                                   latency_s=latency, raw=raw)
 
         except AdapterError as e:
-            return ExecutionResult(
-                output={},
-                model_id=model_id,
-                latency_s=time.time() - start,
-                error=str(e),
-                all_failed=(not e.is_retryable()),
-            )
+            self._audit_log(action="model_execute", outcome="failure",
+                            model_id=model_id, error=str(e),
+                            context=getattr(self, "_last_context", None),
+                            latency_s=time.time() - start)
+            return ExecutionResult(output={}, model_id=model_id,
+                                   latency_s=time.time() - start,
+                                   error=str(e), all_failed=(not e.is_retryable()))
 
         except Exception as e:
-            return ExecutionResult(
-                output={},
-                model_id=model_id,
-                latency_s=time.time() - start,
-                error=f"Unexpected error: {e}",
-                all_failed=True,
-            )
+            self._audit_log(action="model_execute", outcome="error",
+                            model_id=model_id, error=f"Unexpected error: {e}",
+                            context=getattr(self, "_last_context", None),
+                            latency_s=time.time() - start)
+            return ExecutionResult(output={}, model_id=model_id,
+                                   latency_s=time.time() - start,
+                                   error=f"Unexpected error: {e}", all_failed=True)
+
+    # ── Audit helper ────────────────────────────────────────────
+
+    def _audit_log(self, action, outcome, model_id="", context=None,
+                    error=None, latency_s=0, **extra):
+        """Log to audit trail if configured. Never raises."""
+        if self._audit is None:
+            return
+        try:
+            pii_flags = list(self._pii.scan(context)) if (self._pii and context) else []
+            safe_ctx = self._pii.redact(context) if (self._pii and context) else (context or {})
+            self._audit.log(action=action, actor=model_id or "router",
+                            org_id=safe_ctx.get("org_id", ""),
+                            outcome=outcome, model_id=model_id,
+                            context=safe_ctx, pii_detected=pii_flags,
+                            metadata={"latency_s": round(latency_s, 4), **(extra if extra else {})})
+        except Exception:
+            pass
+
+    def set_audit_logger(self, logger: "AuditLogger") -> None:
+        """Attach an audit logger after construction."""
+        self._audit = logger
+        self._pii = PIIDetector() if logger else None
 
     # ── Utilities ──────────────────────────────────────────────
 
