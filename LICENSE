@@ -1,21 +1,55 @@
-MIT License
+# Business Software License (BUSL-1.0)
 
-Copyright (c) 2026 Saabu / OpenClaw
+## Copyright Notice
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+Copyright © 2026 Saabu / OpenClaw. All rights reserved.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+## Commercial Use License
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+This Software is not open source. Use of this Software is subject to the following terms:
+
+### Permitted Use
+
+Subject to the terms of this license, the Licensor grants you a limited, non-exclusive, non-transferable license to:
+
+- **Use** the Software in your internal business operations
+- **Modify** the Software for your own internal use
+- **Reproduce** the Software as necessary to support your permitted use
+
+### Restrictions
+
+You MAY NOT, without the prior written consent of the Licensor:
+
+1. Use the Software to provide services to third parties (e.g., SaaS, API-as-a-service)
+2. Sublicense, sell, distribute, or otherwise make the Software available to third parties
+3. Reverse engineer, disassemble, or decompile the Software
+4. Modify, adapt, or create derivative works of the Software
+5. Remove, alter, or obscure any copyright, trademark, or proprietary notice notices
+6. Use the Software in any product or service that competes with the Software
+7. Use the Software beyond the scope of a commercial license agreement
+
+### Contribution Licensing
+
+If you contribute modifications or improvements to the Software, you must do so under this same BUSL license and must notify the Licensor in writing with a description of your contribution.
+
+### Attribution
+
+All copies of the Software, in whole or in part, must include this copyright notice and license text.
+
+### Warranty Disclaimer
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+### Termination
+
+This license is effective until terminated. It will terminate automatically without notice if you fail to comply with any provision hereof. Upon termination, you must cease all use of the Software and destroy all copies.
+
+### Commercial Licensing
+
+For commercial licenses, enterprise use, API access, or SaaS deployment, contact the Licensor to negotiate terms.
+
+---
+
+**Licensor:** Saabu / OpenClaw  
+**Contact:** [Your contact info]  
+**Website:** https://github.com/myv2ss/modelfungible

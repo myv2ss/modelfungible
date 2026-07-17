@@ -7,7 +7,7 @@ name = "modelfungible"
 version = "0.1.0"
 description = "Universal AI model execution layer — plug in any model, same behavior"
 readme = "README.md"
-license = {text = "MIT"}
+license = {text = "BUSL-1.0"}
 authors = [
     {name = "Saabu", email = "saabu@openclaw.ai"}
 ]

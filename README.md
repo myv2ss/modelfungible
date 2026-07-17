@@ -287,7 +287,9 @@ python3 -m pytest modelfungible/tests/ --cov=modelfungible --cov-report=term-mis
 
 ## License
 
-MIT — use it however you want. Attribution appreciated.
+**BUSL-1.0** — Copyright © 2026 Saabu / OpenClaw. All rights reserved.
+
+Commercial use requires a license. See [LICENSE](LICENSE) for full terms.
 
 ---
 
