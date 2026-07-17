@@ -93,13 +93,27 @@ class RetentionPolicy:
         "default": {"days": 90,   "pii_only": False, "desc": "Default"},
     }
 
-    def __init__(self, regulation="default"):
+    def __init__(
+        self,
+        regulation: str = "default",
+        max_age_days: Optional[int] = None,
+        pii_only: Optional[bool] = None,
+        description: Optional[str] = None,
+    ):
+        """
+        Args:
+            regulation:     named policy (gdpr/hipaa/finra/sec/soc2/pci_dss/default)
+            max_age_days:  OVERRIDE retention period (e.g. 7 for strict GDPR)
+            pii_only:      OVERRIDE PII-only flag
+            description:   OVERRIDE policy description
+        """
         if regulation not in self.POLICIES:
             raise ValueError(f"Unknown regulation: {regulation}")
         cfg = self.POLICIES[regulation]
-        self.max_age_days: int = cfg["days"]
-        self.pii_only: bool = cfg["pii_only"]
-        self.description: str = cfg["desc"]
+        self.regulation = regulation
+        self.max_age_days: int = max_age_days if max_age_days is not None else cfg["days"]
+        self.pii_only: bool = pii_only if pii_only is not None else cfg["pii_only"]
+        self.description: str = description if description is not None else cfg["desc"]
 
     def is_stale(self, entry: dict) -> bool:
         try:

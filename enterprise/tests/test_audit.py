@@ -220,6 +220,24 @@ class TestRetentionPolicy:
         assert policy.max_age_days == 365  # 1 year
 
 
+
+    def test_custom_override_days(self):
+        from modelfungible.enterprise.audit import RetentionPolicy
+        # Override GDPR's 30-day default with stricter 7-day policy
+        policy = RetentionPolicy("gdpr", max_age_days=7)
+        assert policy.max_age_days == 7
+        assert policy.regulation == "gdpr"
+        assert policy.pii_only == True  # inherits from gdpr
+
+    def test_custom_override_all(self):
+        from modelfungible.enterprise.audit import RetentionPolicy
+        # Fully custom policy
+        policy = RetentionPolicy("default", max_age_days=14, pii_only=False,
+                                description="Two-week internal policy")
+        assert policy.max_age_days == 14
+        assert policy.pii_only == False
+        assert policy.description == "Two-week internal policy"
+
 class TestExport:
     def test_export_json(self):
         from modelfungible.enterprise.audit import AuditLogger
