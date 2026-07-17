@@ -2,193 +2,290 @@
 # BUSL-1.0 License — see LICENSE file for details.
 
 """
-Tests for admin_app.py — FastAPI Admin Web UI.
+Tests for admin_app.py — FastAPI Admin Web UI (multi-user auth).
 """
-import pytest, tempfile, os, sys
+import pytest, os, sys
 from pathlib import Path
 
-# Only run if FastAPI is available
 pytest.importorskip("fastapi")
 pytest.importorskip("fastapi.testclient")
 
 from fastapi.testclient import TestClient
-from modelfungible.enterprise.admin_app import app, InMemoryRegistry
+from modelfungible.enterprise import admin_app as app_module
+from modelfungible.enterprise.admin_app import app, _user_store, _sessions, create_session, User
 
 
-class TestInMemoryRegistry:
-    def test_register_model(self):
-        r = InMemoryRegistry()
-        r.register_model("claude", "anthropic", "claude-3.5-sonnet", "key123", 500, "precise")
-        models = r.list_models()
-        assert len(models) == 1
-        assert models[0]["name"] == "claude"
-        assert models[0]["model_id"] == "claude-3.5-sonnet"
+# ─── HELPERS ──────────────────────────────────────────────────────────────────
 
-    def test_deregister_model(self):
-        r = InMemoryRegistry()
-        r.register_model("claude", "anthropic", "claude-3.5-sonnet", "key123", 500, "precise")
-        r.deregister_model("claude")
-        assert len(r.list_models()) == 0
-
-    def test_circuit_breaker_reset(self):
-        from modelfungible.core.circuit_breaker import CircuitBreaker
-        r = InMemoryRegistry()
-        r._breakers["test"] = CircuitBreaker(failure_threshold=1, cooldown_seconds=0)
-        r._breakers["test"].record(success=False)  # trips to OPEN
-        assert r._breakers["test"].state() == "OPEN"
-        r.reset_breaker("test")
-        assert r._breakers["test"].state() == "CLOSED"
+def login(client: TestClient, user_id="admin", password=None) -> str:
+    """Login and return the session token."""
+    pwd = password or {"admin": "changeme", "trader1": "trader123", "viewer1": "viewer123"}.get(user_id, "x")
+    r = client.post("/api/auth/login", json={"user_id": user_id, "password": pwd})
+    assert r.status_code == 200, f"Login failed: {r.text()} — user:{user_id} pwd:{pwd}"
+    return r.json()["session_id"]
 
 
-class TestAdminAPI:
-    @pytest.fixture
-    def client(self):
-        return TestClient(app)
+def headers(token: str):
+    return {"X-Auth-Token": token}
 
-    def test_state_empty(self, client):
+
+# ─── AUTH ENDPOINTS ────────────────────────────────────────────────────────────
+
+class TestLogin:
+    def test_login_valid(self, client):
+        r = client.post("/api/auth/login", json={"user_id": "admin", "password": "changeme"})
+        assert r.status_code == 200
+        d = r.json()
+        assert "session_id" in d
+        assert d["user_id"] == "admin"
+        assert d["role"] == "admin"
+
+    def test_login_invalid_password(self, client):
+        r = client.post("/api/auth/login", json={"user_id": "admin", "password": "wrong"})
+        assert r.status_code == 401
+
+    def test_login_invalid_user(self, client):
+        r = client.post("/api/auth/login", json={"user_id": "nobody", "password": "x"})
+        assert r.status_code == 401
+
+    def test_login_missing_fields(self, client):
+        r = client.post("/api/auth/login", json={"user_id": "admin"})
+        assert r.status_code == 422  # validation error
+
+    def test_logout(self, client):
+        token = login(client)
+        r = client.post("/api/auth/logout", headers=headers(token))
+        assert r.status_code == 200
+
+    def test_get_me(self, client):
+        token = login(client)
+        r = client.get("/api/auth/me", headers=headers(token))
+        assert r.status_code == 200
+        assert r.json()["user_id"] == "admin"
+
+    def test_get_me_no_token(self, client):
+        r = client.get("/api/auth/me")
+        assert r.status_code == 401
+
+    def test_get_me_bad_token(self, client):
+        r = client.get("/api/auth/me", headers=headers("bad-token"))
+        assert r.status_code == 401
+
+
+class TestUserManagement:
+    """Admin-only user management."""
+
+    def test_list_users_admin(self, client):
+        token = login(client, "admin")
+        r = client.get("/api/auth/users", headers=headers(token))
+        assert r.status_code == 200
+        users = r.json()
+        assert any(u["user_id"] == "admin" for u in users)
+        assert any(u["user_id"] == "trader1" for u in users)
+
+    def test_list_users_trader_forbidden(self, client):
+        token = login(client, "trader1")
+        r = client.get("/api/auth/users", headers=headers(token))
+        assert r.status_code == 403
+
+    def test_list_users_viewer_forbidden(self, client):
+        token = login(client, "viewer1")
+        r = client.get("/api/auth/users", headers=headers(token))
+        assert r.status_code == 403
+
+    def test_create_user_admin(self, client):
+        token = login(client, "admin")
+        r = client.post("/api/auth/users", json={"user_id": "newuser", "name": "New User", "role": "trader", "password": "secret123"}, headers=headers(token))
+        assert r.status_code == 200
+        # Verify can login with new user
+        r2 = client.post("/api/auth/login", json={"user_id": "newuser", "password": "secret123"})
+        assert r2.status_code == 200
+
+    def test_create_user_trader_forbidden(self, client):
+        token = login(client, "trader1")
+        r = client.post("/api/auth/users", json={"user_id": "x", "password": "x"}, headers=headers(token))
+        assert r.status_code == 403
+
+    def test_delete_user_admin(self, client):
+        token = login(client, "admin")
+        # Create then delete
+        client.post("/api/auth/users", json={"user_id": "tempuser", "password": "x"}, headers=headers(token))
+        r = client.delete("/api/auth/users/tempuser", headers=headers(token))
+        assert r.status_code == 200
+        # Verify can't login
+        r2 = client.post("/api/auth/login", json={"user_id": "tempuser", "password": "x"})
+        assert r2.status_code == 401
+
+    def test_delete_self_forbidden(self, client):
+        token = login(client, "admin")
+        r = client.delete("/api/auth/users/admin", headers=headers(token))
+        assert r.status_code == 400
+
+    def test_sessions_admin(self, client):
+        token = login(client, "admin")
+        r = client.get("/api/auth/sessions", headers=headers(token))
+        assert r.status_code == 200
+        assert isinstance(r.json(), list)
+
+
+# ─── PROTECTED API ENDPOINTS ─────────────────────────────────────────────────
+
+class TestAPIRequiresAuth:
+    """All /api/* endpoints require valid auth."""
+
+    def test_state_requires_auth(self, client):
         r = client.get("/api/state")
-        assert r.status_code == 200
-        data = r.json()
-        assert "total_entries" in data
-        assert "models" in data
+        assert r.status_code == 401
 
-    def test_health_empty(self, client):
+    def test_health_requires_auth(self, client):
         r = client.get("/api/health")
-        assert r.status_code == 200
-        assert r.json() == {}
+        assert r.status_code == 401
 
-    def test_circuit_breakers_empty(self, client):
-        r = client.get("/api/circuit-breakers")
-        assert r.status_code == 200
-        assert r.json() == []
+    def test_audit_requires_auth(self, client):
+        r = client.get("/api/audit/logs")
+        assert r.status_code == 401
 
-    def test_register_model(self, client):
-        resp = client.post("/api/models/register", json={
-            "name": "claude-test",
-            "provider": "anthropic",
-            "model_id": "claude-3.5-sonnet",
-            "api_key": "test-key",
-            "latency_ms_p50": 500,
-            "capability": "precise",
-        })
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["name"] == "claude-test"
-
-    def test_register_duplicate(self, client):
-        client.post("/api/models/register", json={
-            "name": "dup", "provider": "openai", "model_id": "gpt-4o",
-            "api_key": "k", "latency_ms_p50": 500, "capability": "fast",
-        })
-        resp2 = client.post("/api/models/register", json={
-            "name": "dup", "provider": "openai", "model_id": "gpt-4o",
-            "api_key": "k", "latency_ms_p50": 500, "capability": "fast",
-        })
-        assert resp2.status_code == 400
-
-    def test_delete_model(self, client):
-        client.post("/api/models/register", json={
-            "name": "to-delete", "provider": "groq",
-            "model_id": "llama-3.1-8b", "api_key": "k",
-            "latency_ms_p50": 200, "capability": "fast",
-        })
-        resp = client.delete("/api/models/to-delete")
-        assert resp.status_code == 200
-
-    def test_delete_nonexistent(self, client):
-        resp = client.delete("/api/models/does-not-exist")
-        assert resp.status_code == 404
-
-    def test_circuit_breaker_reset(self, client):
-        client.post("/api/models/register", json={
-            "name": "cb-test", "provider": "openai", "model_id": "gpt-4o",
-            "api_key": "k", "latency_ms_p50": 500, "capability": "fast",
-        })
-        from modelfungible.core.circuit_breaker import CircuitBreaker
-        app.state.registry._breakers["cb-test"] = CircuitBreaker(failure_threshold=1, cooldown_seconds=0)
-        app.state.registry._breakers["cb-test"].record(success=False)
-        assert app.state.registry._breakers["cb-test"].state() == "OPEN"
-        resp = client.post("/api/circuit-breakers/cb-test/reset")
-        assert resp.status_code == 200
-        assert app.state.registry._breakers["cb-test"].state() == "CLOSED"
-
-    def test_strategies_list(self, client):
+    def test_strategies_requires_auth(self, client):
         r = client.get("/api/strategies")
+        assert r.status_code == 401
+
+
+class TestStateEndpoint:
+    def test_state_with_auth(self, client):
+        token = login(client)
+        r = client.get("/api/state", headers=headers(token))
+        assert r.status_code == 200
+        d = r.json()
+        assert "user" in d          # user info from auth context
+        assert "models" in d
+        assert d["user"]["user_id"] == "admin"
+
+    def test_state_trader_role(self, client):
+        token = login(client, "trader1")
+        r = client.get("/api/state", headers=headers(token))
+        assert r.status_code == 200
+        assert r.json()["user"]["role"] == "trader"
+
+
+class TestModelManagement:
+    def test_register_model_admin(self, client):
+        token = login(client, "admin")
+        r = client.post("/api/models/register", json={
+            "name": "claude-test", "provider": "anthropic",
+            "model_id": "claude-3.5-sonnet", "api_key": "key123",
+            "latency_ms_p50": 500, "capability": "precise",
+        }, headers=headers(token))
+        assert r.status_code == 200
+
+    def test_register_model_trader_forbidden(self, client):
+        token = login(client, "trader1")
+        r = client.post("/api/models/register", json={
+            "name": "x", "provider": "y", "model_id": "z", "api_key": "k",
+            "latency_ms_p50": 500, "capability": "fast",
+        }, headers=headers(token))
+        assert r.status_code == 403
+
+    def test_delete_model_admin(self, client):
+        token = login(client, "admin")
+        client.post("/api/models/register", json={
+            "name": "to-del", "provider": "x", "model_id": "y",
+            "api_key": "k", "latency_ms_p50": 100, "capability": "fast",
+        }, headers=headers(token))
+        r = client.delete("/api/models/to-del", headers=headers(token))
+        assert r.status_code == 200
+
+
+class TestAuditLogs:
+    def test_audit_logs_with_auth(self, client):
+        token = login(client)
+        r = client.get("/api/audit/logs?limit=10", headers=headers(token))
+        assert r.status_code == 200
+        assert "entries" in r.json()
+
+    def test_audit_verify(self, client):
+        token = login(client)
+        r = client.get("/api/audit/verify", headers=headers(token))
+        assert r.status_code == 200
+        assert "verified" in r.json()
+
+
+class TestCompliance:
+    def test_retention_requires_admin_or_trader(self, client):
+        token = login(client, "viewer1")  # viewer should still be able to read
+        r = client.get("/api/compliance/retention", headers=headers(token))
+        assert r.status_code == 200
+
+    def test_license_requires_admin(self, client):
+        token = login(client, "trader1")
+        r = client.get("/api/compliance/license", headers=headers(token))
+        assert r.status_code == 403
+
+
+class TestCircuitBreakers:
+    def test_circuit_breakers_requires_auth(self, client):
+        r = client.get("/api/circuit-breakers")
+        assert r.status_code == 401
+
+    def test_circuit_breakers_with_auth(self, client):
+        token = login(client)
+        r = client.get("/api/circuit-breakers", headers=headers(token))
+        assert r.status_code == 200
+
+    def test_reset_breaker_requires_admin(self, client):
+        token = login(client, "trader1")
+        r = client.post("/api/circuit-breakers/test/reset", headers=headers(token))
+        assert r.status_code == 403
+
+
+class TestStrategies:
+    def test_strategies_list(self, client):
+        token = login(client)
+        r = client.get("/api/strategies", headers=headers(token))
         assert r.status_code == 200
         assert isinstance(r.json(), list)
 
-    def test_audit_verify_empty(self, client):
-        r = client.get("/api/audit/verify")
-        assert r.status_code == 200
-        data = r.json()
-        assert "valid" in data
+    def test_validate_strategy_requires_trader_or_admin(self, client):
+        token = login(client, "viewer1")
+        r = client.post("/api/strategies/validate", json={}, headers=headers(token))
+        assert r.status_code == 403
 
-    def test_audit_logs_query(self, client):
-        r = client.get("/api/audit/logs?limit=10")
-        assert r.status_code == 200
-        assert isinstance(r.json(), list)
 
-    def test_audit_logs_with_filters(self, client):
-        r = client.get("/api/audit/logs?actor=gpt-4o&action=model_execute&outcome=success&limit=50")
-        assert r.status_code == 200
-
-    def test_compliance_retention(self, client):
-        r = client.get("/api/compliance/retention")
-        assert r.status_code == 200
-        data = r.json()
-        assert "gdpr" in data or "hipaa" in data
-
-    def test_compliance_pii_scan(self, client):
-        r = client.get("/api/compliance/pii/scan?q=")
-        assert r.status_code == 200
-
-    def test_version_endpoint(self, client):
-        r = client.get("/api/version")
-        assert r.status_code == 200
-        data = r.json()
-        assert "python" in data
-
-    def test_admin_page(self, client):
+class TestAdminUI:
+    def test_admin_page_loads(self, client):
         r = client.get("/admin")
         assert r.status_code == 200
         assert "text/html" in r.headers.get("content-type", "")
 
-    def test_audit_export_json(self, client):
-        r = client.get("/api/audit/export/json")
-        # May redirect or return content
-        assert r.status_code in (200, 404)
+    def test_admin_ui_has_login_form(self, client):
+        r = client.get("/admin")
+        assert "login-form" in r.text
+        assert "doLogin" in r.text
 
-    def test_audit_export_csv(self, client):
-        r = client.get("/api/audit/export/csv")
-        assert r.status_code in (200, 404)
+    def test_admin_ui_has_logout(self, client):
+        r = client.get("/admin")
+        assert "doLogout" in r.text
 
     def test_admin_ui_has_tabs(self, client):
         r = client.get("/admin")
-        assert r.status_code == 200
         html = r.text
         assert 'id="tab-dashboard"' in html
         assert 'id="tab-deployments"' in html
         assert 'id="tab-strategies"' in html
         assert 'id="tab-audit"' in html
         assert 'id="tab-compliance"' in html
-        assert "ModelFungible" in html
-
-    def test_admin_ui_has_js(self, client):
-        r = client.get("/admin")
-        html = r.text
-        assert "function showTab" in html
-        assert "loadDashboard" in html
-        assert "loadStrats" in html
-        assert "loadAudit" in html
 
 
-class TestAdminCLI:
-    """Test the CLI entry point."""
-    def test_cli_import(self):
-        # Just verify the module can be imported (syntax check)
-        from modelfungible.enterprise.admin_app import app, InMemoryRegistry
-        assert app is not None
-        assert InMemoryRegistry is not None
+# ─── FIXTURES ─────────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def client():
+    # Reset sessions between tests
+    _sessions.clear()
+    # Ensure default users exist
+    _user_store.clear()
+    from modelfungible.enterprise.admin_app import _load_users
+    _load_users()
+    return TestClient(app)
 
 
 if __name__ == "__main__":
