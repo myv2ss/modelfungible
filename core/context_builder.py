@@ -15,10 +15,12 @@ from typing import Any, Optional
 
 
 def load_json(path, default=None):
+    if path is None:
+        return default if default is not None else {}
     try:
         with open(path) as f:
             return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+    except (FileNotFoundError, json.JSONDecodeError, TypeError):
         return default if default is not None else {}
 
 

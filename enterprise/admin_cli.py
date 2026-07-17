@@ -126,7 +126,7 @@ def cmd_model_list(args):
 def cmd_strategy_list(args):
     from modelfungible.core.rules_engine import RulesEngine
 
-    rules_path = args.rules or "/root/.openclaw/workspace/trading-desk/data/strategy_rules.json"
+    rules_path = args.rules or str(Path(__file__).parent.parent / "examples" / "strategies")
     if not Path(rules_path).exists():
         print(f"Strategy rules not found: {rules_path}", file=sys.stderr)
         return 1
@@ -142,7 +142,7 @@ def cmd_strategy_list(args):
 def cmd_strategy_validate(args):
     from modelfungible.core.rules_engine import RulesEngine, StrategyValidationError
 
-    rules_path = args.rules or "/root/.openclaw/workspace/trading-desk/data/strategy_rules.json"
+    rules_path = args.rules or str(Path(__file__).parent.parent / "examples" / "strategies")
     if not Path(rules_path).exists():
         print(f"Strategy rules not found: {rules_path}", file=sys.stderr)
         return 1

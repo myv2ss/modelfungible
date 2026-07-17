@@ -1,0 +1,39 @@
+{
+  "contract_risk": {
+    "strategy_id": "contract_risk",
+    "name": "Contract Risk Scoring",
+    "description": "Score a contract for legal risk flags. Assigns risk tier and review priority based on missing clauses, unusual terms, and liability exposure.",
+    "entry_trigger": "risk_score >= 0.7 OR flags CONTAINS 'missing_indemnity' OR flags CONTAINS 'uncap_liability'",
+    "sizing": {
+      "HIGH_RISK": {
+        "amount": 1,
+        "max_positions": 5,
+        "reviewers": 2,
+        "approval_required": true
+      },
+      "MEDIUM_RISK": {
+        "amount": 1,
+        "max_positions": 20,
+        "reviewers": 1,
+        "approval_required": true
+      },
+      "LOW_RISK": {
+        "amount": 0,
+        "max_positions": 100,
+        "reviewers": 0,
+        "approval_required": false
+      }
+    },
+    "stop_loss_pct": 0,
+    "target_gain_pct": 0,
+    "exit": [],
+    "signal_output_schema": {
+      "risk_score": "number (0.0 to 1.0, higher is riskier)",
+      "risk_tier": "string (HIGH | MEDIUM | LOW)",
+      "flags": "array[string] (list of specific risk flags found)",
+      "review_priority": "string (URGENT | HIGH | STANDARD | LOW)",
+      "recommended_action": "string (APPROVE | APPROVE_WITH_CHANGES | REJECT | ESCALATE)",
+      "summary": "string (1-2 sentence risk summary)"
+    }
+  }
+}

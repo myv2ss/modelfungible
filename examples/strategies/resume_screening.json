@@ -1,0 +1,41 @@
+{
+  "resume_screening": {
+    "strategy_id": "resume_screening",
+    "name": "Resume Screening & Candidate Scoring",
+    "description": "Score a resume against job requirements, identify missing qualifications, produce a candidate ranking.",
+    "entry_trigger": "score >= 70 OR missing_qualifications COUNT <= 2",
+    "sizing": {
+      "STRONG_FIT": {
+        "amount": 1,
+        "max_positions": 10,
+        "interview_rounds": 3,
+        "pass_to_hm": true
+      },
+      "POTENTIAL": {
+        "amount": 1,
+        "max_positions": 25,
+        "interview_rounds": 2,
+        "pass_to_hm": true
+      },
+      "UNDERQUALIFIED": {
+        "amount": 0,
+        "max_positions": 100,
+        "interview_rounds": 0,
+        "pass_to_hm": false
+      }
+    },
+    "stop_loss_pct": 0,
+    "target_gain_pct": 0,
+    "exit": [],
+    "signal_output_schema": {
+      "candidate_score": "number (0-100 overall fit)",
+      "skills_match_pct": "number (0-100 % skills matched)",
+      "experience_match": "string (e.g. 3 of 5 years)",
+      "missing_qualifications": "array[string] (missing requirements)",
+      "strongest_skills": "array[string] (top 3 matches)",
+      "fit_tier": "string (STRONG_FIT | POTENTIAL | UNDERQUALIFIED)",
+      "interview_recommendation": "string (ADVANCE | HOLD | REJECT)",
+      "summary": "string (1-2 sentence summary)"
+    }
+  }
+}

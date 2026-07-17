@@ -1,0 +1,43 @@
+{
+  "generated_at": "2026-07-17T09:00:00Z",
+  "context": {
+    "jurisdiction": "New York",
+    "contracts": [
+      {
+        "contract_id": "MSA-2026-0892",
+        "type": "Master Services Agreement",
+        "counterparty": "Acme Corp",
+        "value_usd": 2400000,
+        "term_months": 36,
+        "effective_date": "2026-08-01",
+        "governing_law": "New York",
+        "clauses": [
+          {"id": "indem_1", "type": "indemnification", "text": "Each party shall indemnify...", "flagged": false},
+          {"id": "liab_1", "type": "liability_cap", "text": "Liability shall not exceed...", "flagged": false},
+          {"id": "term_1", "type": "termination", "text": "Either party may terminate...", "flagged": false},
+          {"id": "conf_1", "type": "confidentiality", "text": "All proprietary information...", "flagged": false}
+        ],
+        "flagged_clauses": [
+          {"id": "liab_2", "type": "missing_indemnity", "text": "No indemnity for IP infringement — CLAIMED."},
+          {"id": "liab_3", "type": "uncap_liability", "text": "No cap on consequential damages."}
+        ]
+      },
+      {
+        "contract_id": "NDA-2026-0441",
+        "type": "Non-Disclosure Agreement",
+        "counterparty": "Beta LLC",
+        "value_usd": 0,
+        "term_months": 24,
+        "effective_date": "2026-07-20",
+        "governing_law": "Delaware",
+        "clauses": [
+          {"id": "conf_nda", "type": "confidentiality", "text": "Receiving party shall not disclose...", "flagged": false},
+          {"id": "term_nda", "type": "term", "text": "This NDA expires 24 months from effective date.", "flagged": false}
+        ],
+        "flagged_clauses": []
+      }
+    ],
+    "reviewer": "Legal Ops Team",
+    "policy_version": "2026-Q3"
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "clinical_notes": {
+    "strategy_id": "clinical_notes",
+    "name": "Clinical Note Review & CPT Code Suggestion",
+    "description": "Review clinical notes and suggest CPT codes, identify documentation gaps, flag coding errors.",
+    "entry_trigger": "documentation_gaps >= 1 OR cpt_mismatch == true OR compliance_flags CONTAINS 'modifier_required'",
+    "sizing": {
+      "CRITICAL": {
+        "amount": 1,
+        "max_positions": 10,
+        "reviewer_required": true,
+        "escalate": true
+      },
+      "STANDARD": {
+        "amount": 1,
+        "max_positions": 50,
+        "reviewer_required": false,
+        "escalate": false
+      },
+      "ROUTINE": {
+        "amount": 1,
+        "max_positions": 200,
+        "reviewer_required": false,
+        "escalate": false
+      }
+    },
+    "stop_loss_pct": 0,
+    "target_gain_pct": 0,
+    "exit": [],
+    "signal_output_schema": {
+      "cpt_codes_suggested": "array[string] (recommended CPT codes)",
+      "documentation_gaps": "number (count of missing elements)",
+      "compliance_flags": "array[string] (compliance issues)",
+      "modifier_required": "array[string] (modifiers needed, e.g. -25, -59)",
+      "coding_accuracy_pct": "number (0-100)",
+      "review_priority": "string (CRITICAL | STANDARD | ROUTINE)",
+      "summary": "string (1-2 sentence summary)"
+    }
+  }
+}

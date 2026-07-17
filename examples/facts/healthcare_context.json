@@ -1,0 +1,46 @@
+{
+  "generated_at": "2026-07-17T09:00:00Z",
+  "context": {
+    "facility": "Metro Health System",
+    "department": "Internal Medicine",
+    "notes_batch": [
+      {
+        "note_id": "NOTE-2026-77141",
+        "patient_id": "P-44921",
+        "encounter_date": "2026-07-15",
+        "provider": "Dr. Sarah Chen",
+        "note_type": "Office Visit",
+        "cpt_codes_billed": ["99213", "87880"],
+        "icd10_codes": ["J06.9", "R05.9"],
+        "clinical_elements": [
+          {"element": "chief_complaint", "content": "Cough and congestion for 3 days", "complete": true},
+          {"element": "assessment", "content": "Upper respiratory infection, likely viral", "complete": true},
+          {"element": "plan", "content": "Supportive care, return if symptoms worsen", "complete": true},
+          {"element": "vitals", "content": "BP 122/78, Temp 99.1F, HR 76", "complete": true}
+        ],
+        "compliance_flags": [],
+        "modifier_flags": []
+      },
+      {
+        "note_id": "NOTE-2026-77188",
+        "patient_id": "P-55802",
+        "encounter_date": "2026-07-16",
+        "provider": "Dr. James Okafor",
+        "note_type": "Follow-up Visit",
+        "cpt_codes_billed": ["99214"],
+        "icd10_codes": ["E11.9", "I10"],
+        "clinical_elements": [
+          {"element": "chief_complaint", "content": "Diabetes follow-up, blood sugar management", "complete": true},
+          {"element": "assessment", "content": "Type 2 diabetes, improving with Metformin", "complete": true},
+          {"element": "plan", "content": "Continue current regimen, labs in 30 days", "complete": false},
+          {"element": "medication_reconcile", "content": "Not documented", "complete": false}
+        ],
+        "compliance_flags": ["modifier_required"],
+        "modifier_flags": ["-25"],
+        "cpt_mismatch": true
+      }
+    ],
+    "coder": "Health Information Team",
+    "billing_policy": "2026-CMS-FINAL"
+  }
+}
