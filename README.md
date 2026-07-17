@@ -243,6 +243,25 @@ Contact for enterprise licensing.
 
 ---
 
+## Enterprise Admin UI
+
+ModelFungible includes a built-in web dashboard for managing models, users, and compliance:
+
+```bash
+# Start the admin UI (http://localhost:8000/admin)
+python3 -m modelfungible.enterprise.admin_app
+
+# Default login: admin / changeme (change in production)
+```
+
+Features: Deployments, Strategies, Audit Logs, Compliance, User Management
+
+📖 **Full user guide:** [`docs/enterprise-user-guide.md`](docs/enterprise-user-guide.md)
+📖 **Admin quick start:** [`docs/admin-quick-start.md`](docs/admin-quick-start.md)
+📖 **User quick reference:** [`docs/quick-reference.md`](docs/quick-reference.md)
+
+---
+
 ## Requirements
 
 - Python 3.10+
