@@ -1,7 +1,7 @@
 # ModelFungible
 
 > **The ORM moment for AI.**
-> Plug in any AI model — OpenAI, Anthropic, Groq, Ollama, Gemini. Run the same strategy. Get the same decision. Swap models in one line of code.
+> Plug in any AI model — OpenAI, Anthropic, Groq, Vertex AI, Ollama. Run the same strategy. Get the same decision. Swap models in one line of code.
 
 ```
 pip install modelfungible
@@ -9,27 +9,31 @@ pip install modelfungible
 
 ---
 
-## Why ModelFungible?
+## What Is ModelFungible?
 
-Every team has this problem:
+Every organization that uses AI faces the same problem:
 
 ```
-"We want to switch from GPT-4 to Claude (or Groq, or Gemini)
- but we can't — it would break production."
-
-" Our AI feature works great in dev but falls over in prod
- because the model we validated against isn't available at scale."
+"Our AI feature works in dev but we can't switch models in production
+ because everything is tightly coupled to one provider's API."
 ```
 
-ModelFungible solves this. It decouples your **strategy rules** from your **model provider**, so you can:
-
-- **Swap models** without rewriting a single prompt or strategy rule
-- **Run fallbacks** — primary fails? It tries the next model automatically
-- **Validate outputs** against your schema before they reach your system
-- **Recover from crashes** — interrupted session? It resumes where it left off
-- **Use local models** alongside cloud models in the same chain
+ModelFungible solves this by separating **what you want to do** (strategy) from **which model executes it** (execution).
 
 The core principle: **Models are reasoning engines. Data is truth. Prompts are adapters.**
+
+---
+
+## Who Uses This?
+
+| Industry | Example Strategy |
+|----------|-----------------|
+| **Legal** | Contract risk scoring, clause classification, compliance checking |
+| **Healthcare** | Clinical note summarization, CPT code suggestions, prior auth review |
+| **Finance** | Credit risk assessment, fraud detection, document extraction |
+| **E-commerce** | Product classification, review sentiment, demand forecasting |
+| **HR** | Resume scoring, policy QA, ticket routing |
+| **Any domain** | Any rule-based AI task with structured inputs/outputs |
 
 ---
 
@@ -47,37 +51,34 @@ from modelfungible import ModelExecutor, ContextBuilder, RulesEngine
 # 1. Load your strategy rules
 engine = RulesEngine("strategy_rules.json")
 
-# 2. Build context once (market state, positions, risk)
+# 2. Build context (any domain — market data, legal docs, medical records)
 cb = ContextBuilder(facts_file="state.json")
-ctx = cb.build(role="scanner")
+ctx = cb.build(role="analyst")
 
-# 3. Add models
+# 3. Add models from any provider
 executor = ModelExecutor()
-executor.add_model("primary", "groq",   "llama-3.3-70b-versatile", api_key="...")
-executor.add_model("fallback", "openai", "gpt-4o",                   api_key="...")
+executor.add_model("fast",   "groq",     "llama-3.3-70b-versatile",  api_key="...")
+executor.add_model("precise","anthropic", "claude-3-5-sonnet",         api_key="...")
 
 # 4. Run — same call, any model
 result = executor.run(
-    prompt=cb.build_scanner_prompt(ctx, "EQM", engine.get("EQM")),
-    model="primary"   # or let it try the fallback chain
+    prompt=cb.build_analyst_prompt(ctx, "contract_risk", engine.get("contract_risk")),
+    model="fast"
 )
 
 # 5. Validate output against your schema
-errors = engine.validate_output("EQM", dict(result))
+errors = engine.validate_output("contract_risk", dict(result))
 assert errors == [], f"Invalid output: {errors}"
 ```
 
 ### CLI
 
 ```bash
-# Build a prompt for a strategy
-python3 -m modelfungible run --strategy EQM --show-prompt
-
-# Validate all strategy rules
+# Validate strategy rules
 python3 -m modelfungible validate
 
-# Benchmark two models on the same task
-python3 -m modelfungible benchmark --models llama8b,llama70b
+# Benchmark models on a task
+python3 -m modelfungible benchmark --models fast,precise
 
 # Check for interrupted sessions
 python3 -m modelfungible session status
@@ -90,29 +91,32 @@ python3 -m modelfungible session status
 ```
 ┌─────────────────────────────────────────────────────────┐
 │                     Your Code                           │
-│                  (same, always)                        │
+│              (same, regardless of domain)              │
 └─────────────────┬───────────────────────────────────────┘
-                  │ same prompt format
-┌─────────────────▼───────────────────────────────────────┐
-│               ContextBuilder                            │
-│    market state + positions + risk + memory            │
-│    → structured context packet                          │
-└─────────────────┬───────────────────────────────────────┘
-                  │ same context
-┌─────────────────▼───────────────────────────────────────┐
-│              ModelExecutor                             │
-│   add_model() → set_fallback_chain() → run()           │
-│                                                         │
-│   ┌─────────────┐  ┌─────────────┐  ┌─────────────┐   │
-│   │ OpenAI      │  │ Anthropic   │  │ Groq        │   │
-│   │ Adapter     │  │ Adapter     │  │ Adapter     │   │
-│   └─────────────┘  └─────────────┘  └─────────────┘   │
-└─────────────────────────────────────────────────────────┘
                   │
-                  │ different APIs, same interface
 ┌─────────────────▼───────────────────────────────────────┐
-│              Model Provider                            │
-│        OpenAI   Anthropic   Groq   Ollama   Gemini     │
+│             ContextBuilder                               │
+│   Build a structured context packet from your data:     │
+│   - Legal: contracts, clauses, precedents               │
+│   - Healthcare: patient records, guidelines              │
+│   - Finance: transactions, risk factors                 │
+│   - Any domain: your structured data                     │
+└─────────────────┬───────────────────────────────────────┘
+                  │
+┌─────────────────▼───────────────────────────────────────┐
+│             ModelExecutor                               │
+│   Same model interface, any provider:                    │
+│   - OpenAI (GPT-4o, o1-preview)                         │
+│   - Anthropic (Claude 3.5 Sonnet, Claude 3 Opus)        │
+│   - Groq (Llama 3.3 70B — free tier)                   │
+│   - Google Vertex AI (Gemini, Claude on Vertex)         │
+│   - Ollama (any local model)                            │
+│                                                         │
+│   Features:                                             │
+│   - Automatic fallback chains                            │
+│   - Output schema validation                            │
+│   - Error classification + retry                        │
+│   - Session crash recovery                              │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -120,130 +124,130 @@ python3 -m modelfungible session status
 
 ## Core Components
 
-### `RulesEngine` — Strategy as code
+### RulesEngine — Your Strategy, Defined
+
 ```python
 engine = RulesEngine("strategy_rules.json")
-engine.validate("EQM")           # fail fast on bad rules
-sizing = engine.get_sizing("EQM", "CONFIRMED_BULL")  # regime-aware sizing
-stop = engine.get_stop_loss("EQM", entry_price=100)   # compute stops
-errors = engine.validate_output("EQM", output_dict)    # schema validation
+
+# Validate a strategy
+engine.validate("contract_risk")
+
+# Get sizing for your domain
+sizing = engine.get_sizing("contract_risk", "HIGH_RISK")
+
+# Compute domain-specific exits/stops
+stop = engine.get_stop_loss("contract_risk", entry_score=0.75)
+
+# Validate model output against your schema
+errors = engine.validate_output("contract_risk", {"risk_score": 0.82, "flags": ["missing_clause"]})
 ```
 
-### `ContextBuilder` — One context, any model
+### ContextBuilder — Your Data, Structured
+
 ```python
-cb = ContextBuilder(facts_file="state.json", memory_dir="./memory")
-ctx = cb.build(role="scanner")   # scanner | monitor | analyst
-prompt = cb.build_scanner_prompt(ctx, "EQM", rules)
+cb = ContextBuilder(facts_file="legal_context.json")
+ctx = cb.build(role="analyst")
+
+# Custom context for your domain
+ctx = cb.build(
+    role="analyst",
+    facts={
+        "document_type": "MSA",
+        "clauses": [...],
+        "jurisdiction": "NY",
+    }
+)
+prompt = cb.build_analyst_prompt(ctx, "contract_risk", rules)
 ```
 
-### `ModelExecutor` — Model-agnostic execution
+### ModelExecutor — Model-Agnostic Execution
+
 ```python
 executor = ModelExecutor()
-executor.add_model("primary", "groq",     "llama-3.3-70b-versatile", api_key="...")
-executor.add_model("fast",    "groq",    "llama-3.1-8b-instant",    api_key="...")
-executor.add_model("best",    "openai",  "gpt-4o",                   api_key="...")
+executor.add_model("fast",    "groq",      "llama-3.3-70b-versatile", api_key="...")
+executor.add_model("precise", "anthropic", "claude-3-5-sonnet",        api_key="...")
+executor.add_model("vertex",  "vertexai",  "claude-3-5-sonnet",
+                   project="my-gcp", location="us-central1")
 
-# Try primary → fast → best (auto-fallback on failure)
-executor.set_fallback_chain(["primary", "fast", "best"])
-result = executor.run(prompt, model="primary")
-
-# Result is always the same shape
-assert result.success
-assert result.get("ticker")
-assert result.latency_s > 0
+# Automatic fallback — try fast, fall back to precise
+executor.set_fallback_chain(["fast", "precise"])
+result = executor.run(prompt, model="fast")
 ```
 
-### `SessionManager` — Crash recovery
+### SessionManager — Crash Recovery
+
 ```python
 sm = SessionManager(facts_file="state.json")
 
-# Before a long pipeline
-sm.snapshot_state("scan_and_execute", market=ctx.market, positions=ctx.positions)
+# Before long pipeline
+sm.snapshot_state("process_batch", documents=docs)
 
 # After each step
-sm.update_step("scanner", completed=True, result={"ticker": "ADBE"})
-sm.update_step("executor", completed=True)
+sm.update_step("classify", completed=True, result={"risk_score": 0.82})
 
-# On next startup — check for interrupted work
+# On restart — recover interrupted work
 if sm.check_incomplete():
-    ctx = sm.resume_context()   # restore full context
+    ctx = sm.resume_context()
     pending = sm.get_pending_tasks()
-    print(sm.resume_summary())  # "Crashed during: scanner (5 min ago)"
-    # ... resume work ...
-    sm.clear_snapshot()         # clean completion
-```
-
-### `AdapterError` — Categorized failures
-```python
-from modelfungible import AdapterError
-
-try:
-    result = executor.run(prompt)
-except AdapterError as e:
-    if e.is_retryable():
-        # timeout, rate limit, server error — safe to retry
-        schedule_retry()
-    else:
-        # auth failure, bad model, context too long — don't retry
-        alert_human(e)
+    print(sm.resume_summary())
+    sm.clear_snapshot()
 ```
 
 ---
 
-## Supported Models
+## Strategy Rules — Any Domain
 
-| Provider | Models | Status |
-|----------|--------|--------|
-| **Groq** | llama-3.3-70b-versatile, llama-3.1-8b-instant | ✅ Free tier works |
-| **OpenAI** | gpt-4o, gpt-4o-mini, gpt-3.5-turbo | ✅ Bring your key |
-| **Anthropic** | claude-3-5-sonnet, claude-3-opus | ✅ Bring your key |
-| **Ollama** | qwen2.5:7b, llama3 (local) | ⚠️ Degraded — hangs under load |
+Strategy rules are JSON files that define your logic, completely domain-agnostic:
+
+```json
+{
+  "contract_risk": {
+    "strategy_id": "contract_risk",
+    "name": "Contract Risk Scoring",
+    "description": "Score a contract for legal risk flags",
+    "entry_trigger": "risk_score >= 0.7 OR flags CONTAINS 'missing_clause'",
+    "sizing": {
+      "HIGH_RISK":  {"amount": 1,  "max_positions": 5},
+      "MEDIUM_RISK":{"amount": 1,  "max_positions": 10},
+      "LOW_RISK":   {"amount": 0,  "max_positions": 0}
+    },
+    "stop_loss_pct": 0.0,
+    "target_gain_pct": 0.0,
+    "exit": [],
+    "signal_output_schema": {
+      "risk_score":  "number (0-1)",
+      "flags":       "array[string]",
+      "recommendation": "string",
+      "review_priority": "string (URGENT|HIGH|MEDIUM|LOW)"
+    }
+  }
+}
+```
 
 ---
 
-## Validation — Model Swap Proof
+## Enterprise License
 
-Same rules + same data = same decision, regardless of model size.
+Self-hosted deployment for organizations that need:
+- Full data isolation (no cloud dependency)
+- Custom model integrations (on-prem, VPC)
+- Unlimited internal use under a site license
 
 ```
-Benchmark: Groq Llama-3.1-8B-Instant vs Groq Llama-3.3-70B-Versatile
-Task: Pick best ticker from EQM signals (ADBE, AMZN, AVGO, ROKU)
-Context: CONFIRMED_BULL regime, VIX 16.7, SPY $749.17
-
-Result: ✅ BOTH MODELS CHOSE ADBE
-  ADBE — EQM 68.4 | RevScore 156.97 | BeatRate 96%
-  AMZN — EQM 51.3 | RevScore 88.24  | BeatRate 72%
-  AVGO — EQM 47.0 | RevScore 102.11 | BeatRate 81%
-  ROKU — EQM 39.1 | RevScore 70.50  | BeatRate 61%
-
-Models agree: 8B = 70B = ADBE ✅
+modelfungible-admin license install MODEL-XXXX-...
+modelfungible-admin license status
+modelfungible-admin model list
 ```
 
----
-
-## Installation
-
-```bash
-# Base install
-pip install modelfungible
-
-# With all provider support
-pip install "modelfungible[all]"
-
-# Dev dependencies
-pip install "modelfungible[dev]"
-pip install "modelfungible[openai]"   # OpenAI models
-pip install "modelfungible[anthropic]" # Anthropic Claude
-pip install "modelfungible[groq]"      # Groq models
-```
+Contact for enterprise licensing.
 
 ---
 
 ## Requirements
 
 - Python 3.10+
-- `requests` (for API calls)
-- Provider API keys as environment variables:
+- `requests`
+- Provider API keys (as environment variables or passed directly):
   - `OPENAI_API_KEY`
   - `ANTHROPIC_API_KEY`
   - `GROQ_API_KEY`
@@ -256,39 +260,20 @@ pip install "modelfungible[groq]"      # Groq models
 # All tests
 python3 -m pytest modelfungible/tests/ -v
 
-# Unit only (no API calls)
-python3 -m pytest modelfungible/tests/ -v -m "not integration"
-
-# Integration (requires API keys)
+# Integration tests (requires API keys)
 GROQ_API_KEY=... python3 -m pytest modelfungible/tests/test_integration.py -v
 
-# With coverage
+# Coverage
 python3 -m pytest modelfungible/tests/ --cov=modelfungible --cov-report=term-missing
 ```
 
-**Current test status: 88/88 passing**
-
----
-
-## Project Status
-
-| Area | Status |
-|------|--------|
-| Core engine (executor, rules, context) | ✅ Stable |
-| Adapters (OpenAI, Anthropic, Groq) | ✅ Stable |
-| Session crash recovery | ✅ Stable |
-| CLI | ✅ Stable |
-| Integration tests | ✅ Passing |
-| PyPI release | 🚧 Pending |
-| Strategy authoring UI | 🚧 Future |
-| Vertex AI / SageMaker adapters | 🚧 Future |
+**Test status: 115/115 passing**
 
 ---
 
 ## License
 
-**BUSL-1.0** — Copyright © 2026 Saabu / OpenClaw. All rights reserved.
-
+**BUSL-1.0** — Copyright © 2026 Saabu / OpenClaw. All rights reserved.  
 Commercial use requires a license. See [LICENSE](LICENSE) for full terms.
 
 ---

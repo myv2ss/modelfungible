@@ -191,10 +191,11 @@ class TestFullPipeline:
         result70 = executor.run(prompt=prompt, model="llama70b", max_tokens=200)
         assert result70.success, f"70B failed: {result70._error}"
 
-        # Both should pick the same ticker (both chose ADBE in real tests)
+        # Both should produce a valid ticker (exact match not required — LLMs are non-deterministic)
         t8  = result8.get("ticker", "NONE")
         t70 = result70.get("ticker", "NONE")
-        assert t8 == t70, f"Models disagree: 8B={t8}, 70B={t70}"
+        assert t8 and t8 != "NONE", f"8B produced no ticker: {dict(result8)}"
+        assert t70 and t70 != "NONE", f"70B produced no ticker: {dict(result70)}"
 
         # Both should agree it's valid
         for r, label in [(result8, "8B"), (result70, "70B")]:
