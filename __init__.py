@@ -29,6 +29,14 @@ from modelfungible.core.cost_router import (
 )
 from modelfungible.adapters.base import AdapterError, ParsedOutput
 from modelfungible.enterprise.license import LicenseKey, LicenseGenerator
+from modelfungible.core.circuit_breaker import (
+    CircuitBreaker,
+    CircuitOpenError,
+    RetryWithBackoff,
+    RetryExhausted,
+    is_retryable_error,
+    call_with_protection,
+)
 
 __all__ = [
     # Core
