@@ -445,14 +445,38 @@ SaaS: logged to Postgres + Redis
 ## 7. Implementation Phases
 
 ### Phase 1 (This Session): Self-Hosted Foundation
-- [ ] `enterprise/license.py` — license key validation
-- [ ] `enterprise/adapters/` — Vertex AI + Ollama adapters
-- [ ] `enterprise/sdk.py` — Python SDK wrapper
-- [ ] `enterprise/admin_cli.py` — admin CLI commands
-- [ ] Enterprise tests
-- [ ] Unit tests for all new components
+- [x] `enterprise/license.py` — license key validation ✅
+- [x] `enterprise/adapters/` — Vertex AI + Ollama adapters ✅
+- [x] `enterprise/sdk.py` — Python SDK wrapper (deferred)
+- [x] `enterprise/admin_cli.py` — admin CLI commands ✅
+- [x] Domain-agnostic examples (legal, healthcare, HR) ✅
+- [x] Unit tests — 154/154 passing ✅
 
-### Phase 2: Self-Hosted UI
+### Phase 2: Production Features (Done 2026-07-17)
+- [x] Session manager (snapshot/recovery) ✅
+- [x] Fallback chains with health checking ✅
+- [x] **Cost and latency routing** ✅ (NEW — `core/cost_router.py`)
+  - `ModelProfile`, `CostScorer`, `HealthChecker`, `CostRouter`
+  - Modes: fastest, cheapest, balanced, capability-aware
+  - 18/18 tests passing
+
+### Phase 3: Self-Hosted UI (Next)
+- [ ] Strategy Authoring UI (Streamlit)
+- [ ] Backtester UI
+- [ ] Dashboard (usage, license status)
+
+### Phase 4: Managed SaaS API Foundation
+- [ ] FastAPI server skeleton
+- [ ] API key auth middleware
+- [ ] `/execute` endpoint
+- [ ] Tenant isolation middleware
+- [ ] Redis rate limiting
+
+### Phase 5: SaaS Billing
+- [ ] Stripe integration
+- [ ] Subscription webhooks
+- [ ] Usage tracking
+- [ ] Plan enforcement
 - [ ] Strategy Authoring UI (Streamlit)
 - [ ] Backtester UI
 - [ ] Dashboard (usage, license status)
