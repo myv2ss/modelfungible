@@ -18,6 +18,7 @@ from modelfungible.adapters.base import BaseAdapter, AdapterError, parse_json_ou
 from modelfungible.adapters.openai import OpenAIAdapter
 from modelfungible.adapters.anthropic import AnthropicAdapter
 from modelfungible.adapters.groq import GroqAdapter
+from modelfungible.core.cost_router import CostRouter, ModelProfile, HealthChecker
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -103,10 +104,13 @@ class ModelExecutor:
         "groq":      GroqAdapter,
     }
 
-    def __init__(self):
+    def __init__(self, router_mode: str = "balanced"):
         self._adapters:    dict[str, BaseAdapter] = {}
-        self._models:      dict[str, dict]        = {}   # name → {provider, model}
+        self._models:      dict[str, dict]        = {}   # name → {provider, model_id, profile}
         self._chain:       list[str]              = []
+        self._health = HealthChecker()
+        self._router_mode = router_mode
+        self._profiles: dict[str, ModelProfile] = {}  # name → ModelProfile
 
         # Register default adapters
         for name, cls in self._ADAPTERS.items():
@@ -155,6 +159,19 @@ class ModelExecutor:
             "adapter":    adapter,
         }
 
+        # Also register a default profile (can be overridden with update_profile)
+        profile = ModelProfile(
+            name=name,
+            provider=provider,
+            model_id=model_id,
+            cost_per_1k_input=0.0,
+            cost_per_1k_output=0.0,
+            latency_ms_p50=provider_kwargs.get("latency_ms_p50", 500),
+            latency_ms_p95=provider_kwargs.get("latency_ms_p95", 1000),
+            capability=provider_kwargs.get("capability", "any"),
+        )
+        self._profiles[name] = profile
+
     def set_fallback_chain(self, chain: list[str]):
         """
         Set the fallback chain — ordered list of model names to try.
@@ -170,6 +187,7 @@ class ModelExecutor:
         self,
         prompt: str,
         model: str | None = None,
+        router_mode: str | None = None,
         system_prompt: str | None = None,
         temperature: float = 0.1,
         max_tokens: int = 500,
@@ -194,11 +212,33 @@ class ModelExecutor:
             ExecutionResult
         """
         chain = fallback_chain or self._chain
+        active_mode = router_mode or self._router_mode
 
         # If specific model given, use it directly (no fallback)
         if model:
             return self._call_single(model, prompt, system_prompt,
                                      temperature, max_tokens, **kwargs)
+
+        # No specific model and no chain → use cost router
+        if not model and not chain:
+            router = CostRouter(
+                list(self._profiles.values()),
+                mode=active_mode,
+                health_checker=self._health,
+            )
+            selected = router.get_model()
+            if selected:
+                return self._call_single(
+                    selected.name, prompt, system_prompt,
+                    temperature, max_tokens, **kwargs
+                )
+            else:
+                return ExecutionResult(
+                    output={},
+                    model_id="router",
+                    error="No healthy models available",
+                    all_failed=True,
+                )
 
         # Try chain in order
         fallback_used = None
@@ -215,8 +255,15 @@ class ModelExecutor:
                     temperature, max_tokens, **kwargs
                 )
                 if result.success:
+                    # Record outcome for cost router
+                    self._health.record(
+                        model_name,
+                        success=True,
+                        latency_ms=result.latency_s * 1000,
+                    )
                     return result
                 last_error = result._error
+                self._health.record(model_name, success=False, latency_ms=0)
             except AdapterError as e:
                 last_error = str(e)
                 if not e.is_retryable():

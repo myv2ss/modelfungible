@@ -4,34 +4,35 @@
 """
 Cost and Latency Router — ModelFungible Core
 
-Automatically selects the best model based on:
-- Cost efficiency (cheapest tokens)
-- Latency (fastest response)
-- Capability match (model is suited for the task)
-- Health (skip failing models)
+Automatically selects the best model for a given task based on:
+- Latency (fastest)
+- Cost (cheapest)
+- Balanced (latency + cost)
+- Capability (task-specific routing)
+
+Also tracks model health and auto-skips failing models.
 
 Usage:
-    router = CostRouter(profiles={
-        "fast": ModelProfile(name="fast", provider="groq", model_id="llama-3.1-8b", latency_ms=200),
-        "precise": ModelProfile(name="precise", provider="anthropic", model_id="claude-3-5-sonnet", latency_ms=2000),
-    })
+    from modelfungible.core.cost_router import CostRouter, ModelProfile
 
-    # Route by speed
-    model = router.route(mode="fastest")
+    profiles = [
+        ModelProfile(name="fast", provider="groq", model_id="llama-3.1-8b",
+                    cost_per_1k_input=0.0, cost_per_1k_output=0.0,
+                    latency_ms_p50=150, latency_ms_p95=300, capability="fast"),
+        ModelProfile(name="precise", provider="anthropic", model_id="claude-3-5-sonnet",
+                    cost_per_1k_input=0.003, cost_per_1k_output=0.015,
+                    latency_ms_p50=600, latency_ms_p95=1200, capability="precise"),
+    ]
 
-    # Route by cost
-    model = router.route(mode="cheapest", input_tokens=1000, output_tokens=500)
-
-    # Route by capability
-    model = router.route(mode="fastest", capability="analysis")
-
-    # Record real latency after a call
-    router.health.record("fast", latency_ms=180, success=True)
+    router = CostRouter(profiles, mode="balanced")
+    best = router.get_model()  # returns ModelProfile
+    router.record_outcome(best.name, success=True, latency_ms=180)
 """
 from __future__ import annotations
+import time
 from dataclasses import dataclass, field
 from typing import Optional
-import time
+from collections import deque
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -40,33 +41,44 @@ import time
 @dataclass
 class ModelProfile:
     """
-    Describes a model's cost, latency, and capability profile.
+    Static profile of a model's cost and latency characteristics.
 
     Args:
-        name:             Unique identifier for this model config
+        name:             unique identifier for this model in the router
         provider:         "openai" | "anthropic" | "groq" | "vertexai" | "ollama"
-        model_id:         Provider's model identifier
-        cost_per_1k_input:  Cost per 1,000 input tokens (USD)
-        cost_per_1k_output: Cost per 1,000 output tokens (USD)
-        latency_ms:        Estimated round-trip latency (ms)
-        capabilities:      Tags describing what this model does well
-                          e.g. ["fast", "classification", "reasoning", "extraction"]
-        available:        Whether the model is currently reachable
+        model_id:         provider's model identifier (e.g. "gpt-4o")
+        cost_per_1k_input:  cost per 1,000 input tokens (USD)
+        cost_per_1k_output: cost per 1,000 output tokens (USD)
+        latency_ms_p50:   median latency in milliseconds
+        latency_ms_p95:   95th percentile latency in milliseconds
+        capability:       "fast" | "precise" | "coder" | "reasoner" | "any"
     """
-
     name: str
     provider: str
     model_id: str
-    cost_per_1k_input: float = 0.0
-    cost_per_1k_output: float = 0.0
-    latency_ms: int = 1000
-    capabilities: list[str] = field(default_factory=list)
-    available: bool = True
+    cost_per_1k_input: float
+    cost_per_1k_output: float
+    latency_ms_p50: int
+    latency_ms_p95: int
+    capability: str = "any"
+
+    def __eq__(self, other):
+        if not isinstance(other, ModelProfile):
+            return False
+        return (
+            self.name == other.name
+            and self.provider == other.provider
+            and self.model_id == other.model_id
+        )
+
+    def __hash__(self):
+        return hash((self.name, self.provider, self.model_id))
 
     def estimated_cost(self, input_tokens: int, output_tokens: int) -> float:
         """Estimate total cost for a call with given token counts."""
-        return (input_tokens / 1000.0) * self.cost_per_1k_input + \
-               (output_tokens / 1000.0) * self.cost_per_1k_output
+        in_cost = (input_tokens / 1000) * self.cost_per_1k_input
+        out_cost = (output_tokens / 1000) * self.cost_per_1k_output
+        return in_cost + out_cost
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -74,154 +86,88 @@ class ModelProfile:
 # ─────────────────────────────────────────────────────────────────
 class HealthChecker:
     """
-    Tracks model health: latency history and success/failure rate.
+    Tracks model health via a sliding window of success/failure records.
 
-    Uses a sliding window of recent calls to determine if a model
-    should be skipped (too many failures) or is recovering.
+    A model is "healthy" if its success rate in the window exceeds the threshold.
+    Failed models are auto-skipped by CostRouter.
     """
 
-    def __init__(self, failure_threshold: int = 3, window_size: int = 10):
+    def __init__(
+        self,
+        window: int = 10,
+        success_rate_threshold: float = 0.5,
+        failure_threshold: int = 3,
+    ):
         """
         Args:
-            failure_threshold: Consecutive failures before marking unavailable
-            window_size: Number of recent calls to track per model
+            window:                  number of recent calls to track per model
+            success_rate_threshold:  fraction of successes required (0.0-1.0)
+            failure_threshold:       consecutive failures that mark a model unhealthy
         """
+        self.window = window
+        self.success_rate_threshold = success_rate_threshold
         self.failure_threshold = failure_threshold
-        self.window_size = window_size
-        self._history: dict[str, list[tuple[float, bool]]] = {}  # name → [(latency_ms, success)]
+        # {model_name: deque of (success: bool, latency_ms: float, timestamp: float)}
+        self._records: dict[str, deque] = {}
 
-    def record(self, model_name: str, latency_ms: float, success: bool) -> None:
-        """Record a single call result."""
-        if model_name not in self._history:
-            self._history[model_name] = []
-        self._history[model_name].append((latency_ms, success))
-        # Keep only window_size recent entries
-        if len(self._history[model_name]) > self.window_size:
-            self._history[model_name] = self._history[model_name][-self.window_size:]
+    def record(self, model_name: str, success: bool, latency_ms: float) -> None:
+        """Record a call outcome for a model."""
+        if model_name not in self._records:
+            self._records[model_name] = deque(maxlen=self.window)
+        self._records[model_name].append((success, latency_ms, time.time()))
 
-    def is_available(self, model_name: str) -> bool:
-        """Return True if model has no recent consecutive failures."""
-        if model_name not in self._history:
-            return True  # No history → assume available
-        history = self._history[model_name]
-        if len(history) < self.failure_threshold:
+    def is_healthy(self, model_name: str) -> bool:
+        """Return True if model is healthy (passes success rate + consecutive failure check)."""
+        if model_name not in self._records:
+            return True  # New models are healthy by default
+
+        records = self._records[model_name]
+        if not records:
             return True
-        # Check last N calls
-        recent = history[-self.failure_threshold:]
-        if all(not success for _, success in recent):
-            return False
-        return True
 
-    def get_avg_latency(self, model_name: str) -> float:
-        """Return average latency for successful calls."""
-        if model_name not in self._history:
-            return 0.0
-        successes = [ms for ms, ok in self._history[model_name] if ok and ms > 0]
-        return sum(successes) / len(successes) if successes else 0.0
+        # Check consecutive failures first
+        consecutive = 0
+        for success, _, _ in reversed(records):
+            if not success:
+                consecutive += 1
+            else:
+                break
+        if consecutive >= self.failure_threshold:
+            return False
+
+        # Check overall success rate
+        n = len(records)
+        successes = sum(1 for s, _, _ in records if s)
+        return (successes / n) >= self.success_rate_threshold
 
     def get_success_rate(self, model_name: str) -> float:
-        """Return fraction of successful calls in the window."""
-        if model_name not in self._history:
+        """Return success rate as a fraction (0.0-1.0). Returns 1.0 for unknown models."""
+        if model_name not in self._records or not self._records[model_name]:
             return 1.0
-        history = self._history[model_name]
-        if not history:
-            return 1.0
-        return sum(1 for _, ok in history if ok) / len(history)
+        records = self._records[model_name]
+        successes = sum(1 for s, _, _ in records if s)
+        return successes / len(records)
 
-    def get_healthy_models(self, profiles: dict[str, ModelProfile]) -> dict[str, ModelProfile]:
-        """Filter a profiles dict to only include available models."""
-        return {n: p for n, p in profiles.items() if self.is_available(n)}
-
-
-# ─────────────────────────────────────────────────────────────────
-# CostScorer
-# ─────────────────────────────────────────────────────────────────
-class CostScorer:
-    """
-    Scores and ranks models by various criteria.
-    """
-
-    def find_cheapest(
-        self,
-        profiles: dict[str, ModelProfile],
-        input_tokens: int = 1000,
-        output_tokens: int = 500,
-    ) -> Optional[ModelProfile]:
-        """Find the lowest-cost model (by estimated total cost)."""
-        if not profiles:
+    def get_latency_p95(self, model_name: str) -> Optional[float]:
+        """Return 95th percentile latency from recorded calls. None if no data."""
+        if model_name not in self._records or not self._records[model_name]:
             return None
-        scored = [(p.estimated_cost(input_tokens, output_tokens), p) for p in profiles.values()]
-        scored.sort(key=lambda x: (x[0], x[1].latency_ms))  # cost primary, latency tiebreak
-        return scored[0][1]
+        records = self._records[model_name]
+        latencies = sorted(lat for _, lat, _ in records if lat > 0)
+        if not latencies:
+            return 0.0
+        idx = int(len(latencies) * 0.95)
+        idx = min(idx, len(latencies) - 1)
+        return latencies[idx]
 
-    def find_fastest(self, profiles: dict[str, ModelProfile]) -> Optional[ModelProfile]:
-        """Find the model with lowest estimated latency."""
-        if not profiles:
-            return None
-        available = [p for p in profiles.values() if p.available]
-        if not available:
-            return None
-        return min(available, key=lambda p: p.latency_ms)
+    def get_healthy_models(self, profiles: list[ModelProfile]) -> list[ModelProfile]:
+        """Return only models that are currently healthy."""
+        return [p for p in profiles if self.is_healthy(p.name)]
 
-    def find_balanced(self, profiles: dict[str, ModelProfile]) -> Optional[ModelProfile]:
-        """
-        Find the best balance of cost and latency.
-        Normalizes both to 0-1 scores and picks the model with the best combined score.
-        """
-        if not profiles:
-            return None
-        available = [p for p in profiles.values() if p.available]
-        if not available:
-            return None
-
-        # Normalize cost (lower = better)
-        costs = [p.cost_per_1k_input + p.cost_per_1k_output for p in available]
-        latencies = [p.latency_ms for p in available]
-        max_cost = max(costs) if max(costs) > 0 else 1
-        max_lat = max(latencies) if max(latencies) > 0 else 1
-
-        best = None
-        best_score = float("inf")
-        for p in available:
-            cost_score = (p.cost_per_1k_input + p.cost_per_1k_output) / max_cost
-            lat_score = p.latency_ms / max_lat
-            # Equal weight: cost and latency both matter
-            combined = cost_score + lat_score
-            if combined < best_score:
-                best_score = combined
-                best = p
-        return best
-
-    def find_by_capability(
-        self,
-        profiles: dict[str, ModelProfile],
-        capability: str,
-    ) -> Optional[ModelProfile]:
-        """
-        Find the best model that supports a given capability.
-        Falls back to the fastest available model if no capability match.
-        """
-        if not profiles:
-            return None
-        available = [p for p in profiles.values() if p.available]
-        if not available:
-            return None
-
-        capable = [p for p in available if capability in p.capabilities]
-        if not capable:
-            # Fall back to fastest
-            return min(available, key=lambda p: p.latency_ms)
-        # Pick cheapest among capable
-        return min(capable, key=lambda p: p.cost_per_1k_input + p.cost_per_1k_output)
-
-    def estimate_cost(
-        self,
-        profile: ModelProfile,
-        input_tokens: int,
-        output_tokens: int,
-    ) -> float:
-        """Estimate cost for a single call."""
-        return profile.estimated_cost(input_tokens, output_tokens)
+    def reset(self, model_name: str) -> None:
+        """Clear health history for a model."""
+        if model_name in self._records:
+            del self._records[model_name]
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -229,103 +175,177 @@ class CostScorer:
 # ─────────────────────────────────────────────────────────────────
 class CostRouter:
     """
-    Main routing interface. Combines profiles + health + scoring.
+    Automatically selects the best model based on mode and health.
+
+    Modes:
+        fastest:    lowest p50 latency (best for real-time)
+        cheapest:   lowest cost per call (best for batch)
+        balanced:  equal weight of latency + cost (default)
+        capability: pick best model for a specific capability
 
     Usage:
-        router = CostRouter(profiles={
-            "fast": ModelProfile(name="fast", provider="groq", model_id="llama-3.1-8b", latency_ms=200),
-            "precise": ModelProfile(name="precise", provider="anthropic", model_id="claude-3-5-sonnet", latency_ms=2000),
-        })
-
-        # Route
-        model = router.route(mode="fastest")
-        model = router.route(mode="cheapest", input_tokens=1000, output_tokens=500)
-        model = router.route(mode="balanced", capability="analysis")
-
-        # After call completes
-        router.record(model.name, latency_ms=180, success=True)
+        router = CostRouter(profiles, mode="balanced")
+        best = router.get_model(capability_required="precise")
+        router.record_outcome(best.name, success=True, latency_ms=180)
     """
 
     def __init__(
         self,
-        profiles: Optional[dict[str, ModelProfile]] = None,
-        health_checker: Optional[HealthChecker] = None,
-        scorer: Optional[CostScorer] = None,
-    ):
-        self.profiles = profiles or {}
-        self.health = health_checker or HealthChecker()
-        self.scorer = scorer or CostScorer()
-
-    def add_model(self, name: str, profile: ModelProfile) -> None:
-        """Register a model profile."""
-        self.profiles[name] = profile
-
-    def route(
-        self,
+        profiles: list[ModelProfile],
         mode: str = "balanced",
-        input_tokens: int = 1000,
-        output_tokens: int = 500,
-        capability: Optional[str] = None,
+        health_checker: Optional[HealthChecker] = None,
+    ):
+        """
+        Args:
+            profiles:          list of ModelProfile for available models
+            mode:              "fastest" | "cheapest" | "balanced" | "capability"
+            health_checker:    optional HealthChecker for auto-skipping failing models
+        """
+        self.profiles = {p.name: p for p in profiles}
+        self.mode = mode
+        self.health = health_checker or HealthChecker()
+
+    # ── Selection ────────────────────────────────────────────────
+
+    def get_model(
+        self,
+        capability_required: Optional[str] = None,
     ) -> Optional[ModelProfile]:
         """
-        Route to the best model for the given criteria.
+        Select the best model based on current mode and health.
 
         Args:
-            mode:          "fastest" | "cheapest" | "balanced" | "capability"
-            input_tokens:  Estimated input token count (for cost mode)
-            output_tokens: Estimated output token count (for cost mode)
-            capability:    Required capability (for capability mode)
+            capability_required: filter to models with this capability
+                               (only used in "capability" mode)
 
         Returns:
-            Selected ModelProfile, or None if no healthy models available.
+            ModelProfile, or None if no healthy models available.
         """
-        # Filter to healthy models
-        candidates = self.health.get_healthy_models(self.profiles)
+        candidates = self._filter_candidates(capability_required)
         if not candidates:
             return None
 
-        # If capability specified, filter to capable models first (then apply mode)
-        if capability:
-            capable = [p for p in candidates.values()
-                       if capability in p.capabilities]
-            if capable:
-                candidates = {p.name: p for p in capable}
+        if self.mode == "fastest":
+            return self._select_fastest(candidates)
+        elif self.mode == "cheapest":
+            return self._select_cheapest(candidates)
+        elif self.mode == "capability":
+            return self._select_capability(candidates, capability_required)
+        else:  # balanced (default)
+            return self._select_balanced(candidates)
 
-        if mode == "fastest":
-            return self.scorer.find_fastest(candidates)
+    def get_cost_estimate(
+        self,
+        model_name: str,
+        input_tokens: int,
+        output_tokens: int,
+    ) -> Optional[float]:
+        """Return estimated cost in USD for a call on a named model."""
+        profile = self.profiles.get(model_name)
+        if not profile:
+            return None
+        return profile.estimated_cost(input_tokens, output_tokens)
 
-        elif mode == "cheapest":
-            return self.scorer.find_cheapest(candidates, input_tokens, output_tokens)
+    def get_latency_estimate(self, model_name: str) -> Optional[int]:
+        """Return p50 latency estimate in ms for a named model."""
+        profile = self.profiles.get(model_name)
+        if not profile:
+            return None
+        return profile.latency_ms_p50
 
-        elif mode == "balanced":
-            return self.scorer.find_balanced(candidates)
+    def record_outcome(
+        self,
+        model_name: str,
+        success: bool,
+        latency_ms: float,
+    ) -> None:
+        """Record a call outcome — updates health history."""
+        self.health.record(model_name, success, latency_ms)
 
-        elif mode == "capability":
-            if not capability or not candidates:
-                return self.scorer.find_fastest(candidates)
-            return self.scorer.find_by_capability(candidates, capability)
+    # ── Private selection helpers ─────────────────────────────────
 
-        else:
-            # Default: balanced
-            return self.scorer.find_balanced(candidates)
+    def _filter_candidates(
+        self,
+        capability: Optional[str],
+    ) -> list[ModelProfile]:
+        """Return healthy models matching the required capability."""
+        all_profiles = list(self.profiles.values())
+        healthy = self.health.get_healthy_models(all_profiles)
+        if not capability or capability == "any":
+            return healthy
+        return [p for p in healthy if p.capability == capability or p.capability == "any"]
 
-    def record(self, model_name: str, latency_ms: float, success: bool) -> None:
-        """Record a call result for health tracking."""
-        self.health.record(model_name, latency_ms, success)
+    def _select_fastest(self, candidates: list[ModelProfile]) -> ModelProfile:
+        return min(candidates, key=lambda p: p.latency_ms_p50)
 
-    def get_model_info(self, model_name: str) -> Optional[ModelProfile]:
-        """Return profile for a specific model."""
-        return self.profiles.get(model_name)
+    def _select_cheapest(self, candidates: list[ModelProfile]) -> ModelProfile:
+        # Use p50 estimate: 1000 input + 200 output tokens as standard
+        def cost_key(p):
+            return p.estimated_cost(1000, 200)
+        return min(candidates, key=cost_key)
 
-    def set_unavailable(self, model_name: str) -> None:
-        """Manually mark a model as unavailable."""
-        if model_name in self.profiles:
-            self.profiles[model_name].available = False
+    def _select_capability(
+        self,
+        candidates: list[ModelProfile],
+        required: Optional[str],
+    ) -> ModelProfile:
+        # Among capability-matched models, pick cheapest
+        return self._select_cheapest(candidates)
 
-    def set_available(self, model_name: str) -> None:
-        """Manually mark a model as available (after recovery)."""
-        if model_name in self.profiles:
-            self.profiles[model_name].available = True
+    def _select_balanced(self, candidates: list[ModelProfile]) -> ModelProfile:
+        """
+        Score each model: normalized_latency (0-1) + normalized_cost (0-1), lower = better.
+        """
+        if len(candidates) == 1:
+            return candidates[0]
+
+        # Normalize latency (lowest = 0, highest = 1)
+        latencies = [p.latency_ms_p50 for p in candidates]
+        min_lat, max_lat = min(latencies), max(latencies)
+        lat_range = max_lat - min_lat or 1
+
+        # Normalize cost (lowest = 0, highest = 1)
+        costs = [p.estimated_cost(1000, 200) for p in candidates]
+        min_cost, max_cost = min(costs), max(costs)
+        cost_range = max_cost - min_cost or 1
+
+        best = None
+        best_score = float("inf")
+        for p in candidates:
+            norm_lat = (p.latency_ms_p50 - min_lat) / lat_range
+            norm_cost = (p.estimated_cost(1000, 200) - min_cost) / cost_range
+            score = norm_lat + norm_cost  # equal weight
+            if score < best_score:
+                best_score = score
+                best = p
+        return best
 
 
-__all__ = ["CostRouter", "CostScorer", "HealthChecker", "ModelProfile"]
+# ─────────────────────────────────────────────────────────────────
+# Built-in model profiles (Groq free tier)
+# ─────────────────────────────────────────────────────────────────
+GROQ_FREE_PROFILES = [
+    ModelProfile(
+        name="groq_llama_8b",
+        provider="groq",
+        model_id="llama-3.1-8b-instant",
+        cost_per_1k_input=0.0,
+        cost_per_1k_output=0.0,
+        latency_ms_p50=150,
+        latency_ms_p95=300,
+        capability="fast",
+    ),
+    ModelProfile(
+        name="groq_llama_70b",
+        provider="groq",
+        model_id="llama-3.3-70b-versatile",
+        cost_per_1k_input=0.0,
+        cost_per_1k_output=0.0,
+        latency_ms_p50=800,
+        latency_ms_p95=1500,
+        capability="precise",
+    ),
+]
+
+
+__all__ = ["ModelProfile", "HealthChecker", "CostRouter", "GROQ_FREE_PROFILES"]
