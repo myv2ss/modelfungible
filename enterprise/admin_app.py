@@ -27,12 +27,14 @@ try:
     from modelfungible.enterprise.license import LicenseKey
     from modelfungible.core.circuit_breaker import CircuitBreaker
     from modelfungible.core.rules_engine import RulesEngine
+    from modelfungible.core.execute import ModelSelector, RouterMode, ModelProfile, ExecutionRequest, estimate_cost, DEFAULT_COSTS
 except ImportError:
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
     from enterprise.audit import AuditLogger, PIIDetector, RetentionPolicy
     from enterprise.license import LicenseKey
     from core.circuit_breaker import CircuitBreaker
     from core.rules_engine import RulesEngine
+    from core.execute import ModelSelector, RouterMode, ModelProfile, ExecutionRequest, estimate_cost, DEFAULT_COSTS
 
 
 # ─── MULTI-USER AUTH ──────────────────────────────────────────────────────────
@@ -144,11 +146,23 @@ class InMemoryRegistry:
         self._breakers = {}
         self._engines = {}
 
-    def register_model(self, name, provider, model_id, api_key, latency_ms_p50, capability):
+    def register_model(self, name, provider, model_id, api_key, latency_ms_p50, capability,
+                        cost_input_per_1k=0.001, cost_output_per_1k=0.002):
         if name in self._models:
             raise ValueError(f"Model already registered: {name}")
-        self._models[name] = {"name": name, "provider": provider, "model_id": model_id,
-                              "api_key": api_key, "latency_ms_p50": latency_ms_p50, "capability": capability}
+        # Auto-detect cost from DEFAULT_COSTS if model_id matches
+        for cost_key, costs in DEFAULT_COSTS.items():
+            if cost_key in model_id.lower() or model_id.lower() in cost_key:
+                cost_input_per_1k = costs["input"]
+                cost_output_per_1k = costs["output"]
+                break
+        self._models[name] = {
+            "name": name, "provider": provider, "model_id": model_id,
+            "api_key": api_key, "latency_ms_p50": latency_ms_p50,
+            "capability": capability,
+            "cost_input_per_1k": cost_input_per_1k,
+            "cost_output_per_1k": cost_output_per_1k,
+        }
         self._breakers[name] = CircuitBreaker(failure_threshold=5, cooldown_seconds=60)
         return self._models[name]
 
@@ -166,7 +180,9 @@ class InMemoryRegistry:
             cb = self._breakers.get(name)
             state = cb.state() if cb else "CLOSED"
             health = "healthy" if state == "CLOSED" else ("degraded" if state == "HALF-OPEN" else "circuit_open")
-            out.append({**m, "health": health, "circuit_state": state})
+            out.append({**m, "health": health, "circuit_state": state,
+                         "cost_input_per_1k": m.get("cost_input_per_1k", 0.001),
+                         "cost_output_per_1k": m.get("cost_output_per_1k", 0.002)})
         return out
 
     def list_circuit_breakers(self):
@@ -219,6 +235,23 @@ RULES_PATH = os.environ.get("MODELFUNGIBLE_RULES_PATH",
     str(Path(__file__).parent.parent / "examples" / "strategies"))
 _audit_dir = os.environ.get("MODELFUNGIBLE_AUDIT_DIR", "/tmp/modelfungible_audit")
 _audit_logger = None
+
+
+def _build_model_profiles(registry):
+    profiles = []
+    for name, m in registry._models.items():
+        cb = registry._breakers.get(name)
+        state = cb.state() if cb else "CLOSED"
+        profiles.append(ModelProfile(
+            name=m["name"], provider=m["provider"], model_id=m["model_id"],
+            api_key=m["api_key"], latency_ms_p50=m.get("latency_ms_p50", 500),
+            capability=m.get("capability", "any"),
+            cost_input_per_1k=m.get("cost_input_per_1k", 0.001),
+            cost_output_per_1k=m.get("cost_output_per_1k", 0.002),
+            failure_count=cb._failure_count if cb else 0,
+            is_available=state != "OPEN",
+        ))
+    return profiles
 
 def get_audit_logger():
     global _audit_logger
@@ -377,7 +410,14 @@ def api_model_register(data: dict, ctx: AuthContext = require_admin()):
         if f not in data:
             raise HTTPException(400, f"Missing field: {f}")
     try:
-        model = _registry.register_model(name=data["name"], provider=data["provider"], model_id=data["model_id"], api_key=data["api_key"], latency_ms_p50=int(data["latency_ms_p50"]), capability=data["capability"])
+        model = _registry.register_model(
+            name=data["name"], provider=data["provider"], model_id=data["model_id"],
+            api_key=data["api_key"], latency_ms_p50=int(data["latency_ms_p50"]),
+            capability=data["capability"],
+            cost_input_per_1k=float(data.get("cost_input_per_1k", 0.001)),
+            cost_output_per_1k=float(data.get("cost_output_per_1k", 0.002)),
+        )
+        return JSONResponse({"success": True, "model": model})
         return JSONResponse({"success": True, "model": model})
     except ValueError as e:
         raise HTTPException(409, str(e))
@@ -432,6 +472,253 @@ def api_version(ctx: AuthContext = require_auth()):
     except Exception:
         __version__ = "unknown"
     return JSONResponse({"modelfungible": __version__, "python": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"})
+
+# ─── UNIVERSAL LLM PROXY ───────────────────────────────────────────────────────
+
+def _get_adapter(registry, model_name):
+    m = registry._models.get(model_name)
+    if not m:
+        return None, None
+    p = m["provider"].lower()
+    key = m["api_key"]
+    mid = m["model_id"]
+    if p in ("openai", "openai-compatible", ""):
+        from modelfungible.adapters.openai import OpenAIAdapter
+        return OpenAIAdapter(api_key=key), mid
+    elif p == "anthropic":
+        from modelfungible.adapters.anthropic import AnthropicAdapter
+        return AnthropicAdapter(api_key=key), mid
+    elif p == "groq":
+        from modelfungible.adapters.groq import GroqAdapter
+        return GroqAdapter(api_key=key), mid
+    elif p == "ollama":
+        from modelfungible.enterprise.adapters.ollama import OllamaAdapter
+        return OllamaAdapter(base_url=key or "http://localhost:11434"), mid
+    elif p == "vertexai":
+        from modelfungible.enterprise.adapters.vertexai import VertexAIAdapter
+        return VertexAIAdapter(credentials_path=key or None), mid
+    else:
+        from modelfungible.adapters.openai import OpenAIAdapter
+        return OpenAIAdapter(api_key=key, base_url=p), mid
+
+
+@app.post("/api/execute")
+def api_execute(data: dict, ctx: AuthContext = require_trader_or_admin()):
+    """
+    Universal LLM proxy: POST /api/execute
+    {
+      "prompt": "string",          # required
+      "system": "string",           # optional, default provided
+      "model": "claude-production", # optional — auto-select if absent
+      "mode": "balanced",           # fastest|cheapest|balanced|capability
+      "capability": "precise",     # code|vision|fast|precise|any
+      "max_cost_per_call": 0.05,  # optional — reject if estimated cost exceeds
+      "temperature": 0.7,         # optional
+      "max_tokens": 1024           # optional
+    }
+    """
+    prompt = data.get("prompt", "").strip()
+    if not prompt:
+        raise HTTPException(400, {"error": "prompt is required"})
+
+    system = data.get("system", "You are a helpful assistant.")
+    explicit = data.get("model")
+    mode_str = data.get("mode", "balanced")
+    capability = data.get("capability", "any")
+    max_cost = data.get("max_cost_per_call")
+    temperature = float(data.get("temperature", 0.7))
+    max_tokens = int(data.get("max_tokens", 1024))
+
+    try:
+        router_mode = RouterMode(mode_str)
+    except ValueError:
+        raise HTTPException(400, {"error": f"Invalid mode: {mode_str}. Use: fastest|cheapest|balanced|capability"})
+
+    profiles = _build_model_profiles(_registry)
+    if not profiles:
+        raise HTTPException(503, {"error": "No models registered. Add a model in the Deployments tab."})
+
+    selector = ModelSelector(profiles)
+    req = ExecutionRequest(
+        prompt=prompt, system=system, model=explicit,
+        mode=router_mode, capability=capability,
+        max_cost_per_call=max_cost, temperature=temperature, max_tokens=max_tokens,
+    )
+
+    # Pre-check cost cap
+    if max_cost is not None:
+        est_tokens = max(1, len(prompt) // 4) + max_tokens
+        max_model_cost = max((m.cost_input_per_1k for m in profiles), default=0.001)
+        est_cost = est_tokens / 1000 * max_model_cost
+        if est_cost > max_cost:
+            raise HTTPException(402, {"error": f"Estimated cost ${est_cost:.4f} > max_cost_per_call ${max_cost:.4f}"})
+
+    selected = selector.select(req)
+    if not selected:
+        raise HTTPException(503, {"error": "No available model"})
+
+    # PII scan + redact
+    pii_detected = False
+    pii_flags = []
+    prompt_log = prompt
+    system_log = system
+    try:
+        det = PIIDetector()
+        scanned = det.scan({"p": prompt, "s": system})
+        if scanned:
+            pii_detected = True
+            pii_flags = list(scanned.keys())
+            for k, v in scanned.items():
+                if isinstance(v, str):
+                    prompt_log = prompt_log.replace(v, "[REDACTED]")
+                    system_log = system_log.replace(v, "[REDACTED]")
+    except Exception:
+        pass
+
+    # Execute with fallback
+    output_text = ""
+    latency_ms = 0
+    in_tok = max(1, len(prompt) // 4)
+    out_tok = max_tokens // 2
+    cost = 0.0
+    success = False
+    last_err = ""
+    attempt = 1
+
+    fallback = [selected] + selector.get_fallback_order(selected)
+    tried = []
+
+    for candidate in fallback:
+        if candidate.name in tried:
+            continue
+        tried.append(candidate.name)
+        adapter, model_id = _get_adapter(_registry, candidate.name)
+        if not adapter:
+            continue
+        cb = _registry._breakers.get(candidate.name)
+        if cb and cb.state() == "OPEN":
+            last_err = f"Circuit breaker open for {candidate.name}"
+            continue
+        t0 = time.time()
+        try:
+            raw = adapter.call(prompt=prompt_log, model=model_id, system_prompt=system_log,
+                               temperature=temperature, max_tokens=max_tokens)
+            latency_ms = int((time.time() - t0) * 1000)
+            if isinstance(raw, dict):
+                choices = raw.get("choices", [{}])
+                output_text = choices[0].get("message", {}).get("content", "")
+                usage = raw.get("usage", {})
+                in_tok = usage.get("prompt_tokens", in_tok)
+                out_tok = usage.get("completion_tokens", out_tok)
+            else:
+                output_text = str(raw)
+                out_tok = max(out_tok, len(output_text) // 4)
+            cost = estimate_cost(candidate, in_tok, out_tok)
+            success = True
+            if cb:
+                cb.record(success=True)
+            break
+        except Exception as e:
+            last_err = str(e)
+            latency_ms = int((time.time() - t0) * 1000)
+            if cb:
+                cb.record(success=False)
+
+    audit = get_audit_logger()
+    entry_id = ""
+
+    if not success:
+        if audit:
+            entry_id = audit.log(action="model_execute", actor=ctx.user_id,
+                                  org_id="default-org", outcome="error",
+                                  metadata={"router_mode": router_mode.value,
+                                            "capability": capability,
+                                            "models_tried": tried,
+                                            "last_error": last_err,
+                                            "pii_detected": pii_detected})
+        raise HTTPException(503, {"error": f"All models failed. Last: {last_err}"})
+
+    if audit:
+        entry_id = audit.log(action="model_execute", actor=ctx.user_id,
+                              org_id="default-org", outcome="success",
+                              metadata={"router_mode": router_mode.value,
+                                        "capability": capability,
+                                        "model_selected": selected.name,
+                                        "model_id": model_id,
+                                        "latency_ms": latency_ms,
+                                        "cost_usd": cost,
+                                        "input_tokens_est": in_tok,
+                                        "output_tokens_est": out_tok,
+                                        "pii_detected": pii_detected,
+                                        "pii_flags": pii_flags,
+                                        "attempt_number": attempt})
+
+    return JSONResponse({
+        "output": output_text,
+        "model_id": model_id,
+        "model_name": selected.name,
+        "provider": selected.provider,
+        "latency_ms": latency_ms,
+        "cost": round(cost, 6),
+        "router_mode": router_mode.value,
+        "capability": capability,
+        "pii_detected": pii_detected,
+        "attempt_number": attempt,
+        "audit_entry_id": str(entry_id) if entry_id else "",
+    })
+
+
+@app.get("/api/cost-stats")
+def api_cost_stats(
+    period: str = "day",
+    by: str = "model",
+    ctx: AuthContext = require_auth(),
+):
+    """Cost statistics by model or user."""
+    from datetime import datetime, timedelta, timezone
+    audit = get_audit_logger()
+    if audit is None:
+        return JSONResponse({"error": "Audit unavailable"}, status_code=503)
+
+    now = datetime.now(timezone.utc)
+    if period == "day":
+        start = (now - timedelta(days=1)).isoformat()
+    elif period == "week":
+        start = (now - timedelta(weeks=1)).isoformat()
+    else:
+        start = (now - timedelta(days=30)).isoformat()
+
+    entries = audit.query(start_date=start, action="model_execute", limit=10000)
+
+    by_model = {}
+    by_user = {}
+    total_cost = 0.0
+    for e in entries:
+        m = e.get("metadata", {})
+        if m.get("outcome") == "error":
+            continue
+        c = m.get("cost_usd", 0.0)
+        total_cost += c
+        mn = m.get("model_selected", "unknown")
+        u = e.get("actor", "unknown")
+        by_model[mn] = by_model.get(mn, 0.0) + c
+        by_user[u] = by_user.get(u, 0.0) + c
+
+    def fmt(items):
+        return [{"key": k, "cost_usd": round(v, 4),
+                 "pct": f"{100*v/max(total_cost,0.001):.1f}%"}
+                for k, v in sorted(items, key=lambda x: -x[1])]
+
+    if by == "model":
+        data = fmt(by_model.items())
+    elif by == "user":
+        data = fmt(by_user.items())
+    else:
+        data = {"total_cost_usd": round(total_cost, 4), "total_calls": len(entries),
+                "by_model": fmt(by_model.items()), "by_user": fmt(by_user.items())}
+
+    return JSONResponse({"period": period, "data": data})
+
 
 
 HTML_UI = """<!DOCTYPE html>
@@ -540,6 +827,7 @@ select{cursor:pointer}
     <div class="nav-item active" data-tab="dashboard" onclick="showTab('dashboard')"><span class="icon">📊</span><span>Dashboard</span></div>
     <div class="nav-item" data-tab="deployments" onclick="showTab('deployments')"><span class="icon">🚀</span><span>Deployments</span></div>
     <div class="nav-item" data-tab="strategies" onclick="showTab('strategies')"><span class="icon">⚙️</span><span>Strategies</span></div>
+    <div class="nav-item" data-tab="execute" onclick="showTab('execute')"><span class="icon">▶</span><span>Execute</span></div>
     <div class="nav-item" data-tab="audit" onclick="showTab('audit')"><span class="icon">📋</span><span>Audit Logs</span></div>
     <div class="nav-item" data-tab="compliance" onclick="showTab('compliance')"><span class="icon">🛡️</span><span>Compliance</span></div>
   </div>
@@ -775,7 +1063,8 @@ function del__(p){return fetch(API+p,{method:"DELETE"}).then(function(r){if(!r.o
 function esc(s){if(s==null)return"";return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");}
 function fmtTs(ts){if(!ts)return"";try{return new Date(ts).toLocaleString();}catch(e){return ts;}}
 function hlJson(obj){var s=JSON.stringify(obj,null,2);return s.replace(/("([^"]*)"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?/g,function(m){if(/^"/.test(m)){return(/:$/.test(m)?'<span class="json-key">'+m+'</span>':'<span class="json-str">'+m+'</span>');}if(/true|false/.test(m))return'<span class="json-bool">'+m+'</span>';if(/null/.test(m))return'<span class="json-null">'+m+'</span>';return'<span class="json-num">'+m+'</span>';});}
-function showTab(id){document.querySelectorAll(".tab").forEach(function(t){t.classList.remove("active");});document.querySelectorAll(".nav-item").forEach(function(n){n.classList.remove("active");});document.getElementById("tab-"+id).classList.add("active");document.querySelectorAll(".nav-item").forEach(function(n){if(n.dataset.tab===id)n.classList.add("active");});if(id==="dashboard")loadDashboard();else if(id==="strategies")loadStrats();else if(id==="audit")loadAudit(0);else if(id==="compliance")loadCompliance();else if(id==="deployments")loadDeployments();}
+function showTab(id){document.querySelectorAll(".tab").forEach(function(t){t.classList.remove("active");});document.querySelectorAll(".nav-item").forEach(function(n){n.classList.remove("active");});document.getElementById("tab-"+id).classList.add("active");document.querySelectorAll(".nav-item").forEach(function(n){if(n.dataset.tab===id)n.classList.add("active");});if(id==="dashboard")loadDashboard();else if(id==="strategies")loadStrats();
+  else if(id==="execute")initExecute();else if(id==="audit")loadAudit(0);else if(id==="compliance")loadCompliance();else if(id==="deployments")loadDeployments();}
 async function loadDashboard(){try{var s=await apiGet("/state");var b=await apiGet("/circuit-breakers");document.getElementById("s-total").textContent=s.total_entries||0;document.getElementById("s-today").textContent=s.entries_today||0;document.getElementById("s-models").textContent=s.models?s.models.length:0;document.getElementById("s-breakers").textContent=b.length;try{var v=await apiGet("/audit/verify");var ib=document.getElementById("integrityBadge");ib.className="badge "+(v.valid?"badge-green":"badge-red");ib.textContent=v.valid?"VERIFIED":"TAMPERED";}catch(e){}var mg=document.getElementById("mHealth");document.getElementById("noModels").style.display=(s.models&&s.models.length)?"none":"block";mg.innerHTML="";if(s.models){s.models.forEach(function(m){var n=esc(m.name).replace(/'/g,"\\'");mg.innerHTML+='<div class="model-card"><div class="name">'+esc(m.name)+'</div><div class="meta">'+esc(m.provider)+' / '+esc(m.model_id)+'</div><div class="meta">p50: '+(m.latency_ms_p50||"?")+'ms</div><div class="meta">'+esc(m.capability||"any")+'</div><div class="actions"><button class="btn btn-ghost btn-sm" onclick="testModel(\''+n+'\')">Test</button> <button class="btn btn-danger btn-sm" onclick="deleteModel(\''+n+'\')">Delete</button></div></div>';});}var ct=document.getElementById("cbTable");if(!b.length)ct.innerHTML='<div class="empty">No circuit breakers active.</div>';else{ct.innerHTML='<table><thead><tr><th>Name</th><th>State</th><th>Failures</th><th>Cooldown</th><th></th></tr></thead><tbody>'+b.map(function(x){var n=esc(x.name).replace(/'/g,"\\'");return'<tr><td class="mono">'+esc(x.name)+'</td><td><span class="cb-badge cb-'+(x.state||"CLOSED").toLowerCase().replace("-","")+'">'+esc(x.state||"CLOSED")+'</span></td><td>'+(x.failure_count||0)+'</td><td>'+(x.cooldown_seconds||60)+'s</td><td><button class="btn btn-ghost btn-sm" onclick="resetCb(\''+n+'\')">Reset</button></td></tr>';}).join("")+'</tbody></table>';}try{var logs=await get("/audit/logs?limit=10");var feed=document.getElementById("feed");feed.innerHTML=logs.length?logs.map(function(e){var cls=e.outcome==="success"?"badge-green":e.outcome==="failure"?"badge-red":"badge-yellow";return'<div class="feed-item"><span class="feed-time">'+fmtTs(e.timestamp)+'</span><span class="feed-action">'+esc(e.action)+'</span><span class="feed-actor">'+esc(e.actor||"")+'</span><span class="badge '+cls+'" style="font-size:11px">'+esc(e.outcome||"")+'</span></div>';}).join(""):'<div class="empty">No audit entries yet.</div>';}catch(e){document.getElementById("feed").innerHTML='<div class="empty">Could not load feed.</div>';}}catch(e){console.error(e);}apiGet("/api/version").then(function(v){document.getElementById("verInfo").textContent="v"+(v.modelfungible||"?")+" | Python "+(v.python||"?");}).catch(function(){document.getElementById("verInfo").textContent="ModelFungible Admin";});}
 async function loadDeployments(){try{var s=await apiGet("/state");var t=document.getElementById("mTable");if(!s.models||!s.models.length){t.innerHTML='<div class="empty">No models. Click + Add Model.</div>';return;}t.innerHTML='<table><thead><tr><th>Name</th><th>Provider</th><th>Model ID</th><th>p50</th><th>Capability</th><th></th></tr></thead><tbody>'+s.models.map(function(m){var n=esc(m.name).replace(/'/g,"\\'");return'<tr><td class="mono">'+esc(m.name)+'</td><td>'+esc(m.provider)+'</td><td class="mono">'+esc(m.model_id)+'</td><td>'+(m.latency_ms_p50||"?")+'ms</td><td>'+esc(m.capability||"any")+'</td><td><button class="btn btn-danger btn-sm" onclick="deleteModel(\''+n+'\')">Delete</button></td></tr>';}).join("")+'</tbody></table>';}catch(e){document.getElementById("mTable").innerHTML='<div class="empty">'+esc(e.message)+'</div>';}}
 function showAddForm(){document.getElementById("addForm").style.display="block";document.getElementById("addSuccess").style.display="none";document.getElementById("addErr").style.display="none";}
@@ -800,6 +1089,43 @@ async function loadCompliance(){updateRetDisplay();try{var lic=await apiGet("/co
 var RET_POLICIES={"gdpr":{"days":30,"desc":"EU GDPR"},"hipaa":{"days":2190,"desc":"HIPAA (6yr)"},"finra":{"days":2190,"desc":"FINRA (6yr)"},"sec":{"days":1825,"desc":"SEC (5yr)"},"soc2":{"days":365,"desc":"SOC 2 (1yr)"},"pci_dss":{"days":365,"desc":"PCI-DSS (1yr)"},"default":{"days":90,"desc":"Default (90d)"}};
 function updateRetDisplay(){var sel=document.getElementById("retPolicy").value;var pol=RET_POLICIES[sel]||RET_POLICIES["default"];document.getElementById("retDisplay").innerHTML='<div class=row><span>Regulation</span><span class=ival>'+esc(pol.desc)+'</span></div><div class=row><span>Retention</span><span class=ival>'+pol.days+" days ("+Math.round(pol.days/365*10)/10+" years)</span></div>";}
 async function testPii(){var dataStr=document.getElementById("piiData").value.trim();if(!dataStr){document.getElementById("piiResults").innerHTML='<div class="alert-error">Please enter JSON data.</div>';return;}try{var data=JSON.parse(dataStr);var r=await get("/compliance/pii/scan?q="+encodeURIComponent(dataStr));var results=document.getElementById("piiResults");if(!r.flags||!r.flags.length){results.innerHTML='<div class="alert-success">No PII detected.</div>';}else{results.innerHTML='<div><strong>Detected:</strong> "+r.flags.map(function(f){return"<span class=cb-badge cb-closed style=\'background:rgba(96,165,250,0.15);color:var(--blue)\'>"+esc(f)+"</span>";}).join(" ")+"</div>";}}catch(e){document.getElementById("piiResults").innerHTML='<div class="alert-error">Error: '+esc(e.message)+'</div>';}}
+async function doExecute(){
+  var prompt=document.getElementById("exPrompt").value.trim();
+  if(!prompt){document.getElementById("exOutput").textContent="Please enter a prompt.";return;}
+  var btn=document.getElementById("exBtn");
+  btn.disabled=true;btn.textContent="Running...";
+  document.getElementById("exOutput").innerHTML='<span class="exec-loading">Waiting for model...</span>';
+  try{
+    var body={prompt:prompt,system:document.getElementById("exSystem").value.trim()||"You are a helpful assistant.",mode:document.getElementById("exMode").value,temperature:parseFloat(document.getElementById("exTemp").value)||0.7,max_tokens:parseInt(document.getElementById("exTokens").value)||1024};
+    var model=document.getElementById("exModel").value.trim();
+    if(model)body.model=model;
+    var maxCost=parseFloat(document.getElementById("exMaxCost").value);
+    if(maxCost>0)body.max_cost_per_call=maxCost;
+    if(document.getElementById("exMode").value==="capability")body.capability=document.getElementById("exCap").value;
+    var r=await apiPost("/execute",body);
+    document.getElementById("exOutput").textContent=r.output||"(empty response)";
+    document.getElementById("exCost").textContent="$"+r.cost.toFixed(4);
+    document.getElementById("exLat").textContent=r.latency_ms+"ms";
+    document.getElementById("exModelUsed").textContent=(r.model_name||r.model_id||"?").substring(0,16);
+    var pii=document.getElementById("exPiiBadge");
+    if(r.piidetected){pii.style.display="inline-flex";}else{pii.style.display="none";}
+    var out=document.getElementById("exOutput");
+    out.classList.remove("error");
+  }catch(e){
+    document.getElementById("exOutput").innerHTML="Error: "+esc(e.message||e);
+    document.getElementById("exOutput").classList.add("error");
+    document.getElementById("exCost").textContent="—";
+    document.getElementById("exLat").textContent="—";
+    document.getElementById("exModelUsed").textContent="—";
+  }finally{btn.disabled=false;btn.textContent="Run Execute";}
+}
+function initExecute(){
+  var mode=document.getElementById("exMode").value;
+  document.getElementById("exCapabilityRow").style.display=(mode==="capability")?"block":"none";
+}
+document.getElementById("exMode").addEventListener("change",function(){
+  document.getElementById("exCapabilityRow").style.display=(this.value==="capability")?"block":"none";
+});
 window.onload=function(){checkAuth();};
 </script>
 </body>
