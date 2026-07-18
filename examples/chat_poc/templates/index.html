@@ -72,14 +72,13 @@
   <h1>🐙 ModelFungible <span>Chat POC</span></h1>
   <div class="chip">💰 Today: <strong id="cost-total">$0.000000</strong></div>
   <div class="chip">⏱ <span id="last-lat">—</span></div>
+  <div class="chip" id="mode-chip" style="font-size:10px">🔗 Gateway</div>
   <select id="model-select" class="model-select">
-    <option value="">Auto (balanced)</option>
-    <option value="groq/llama-3.3-70b-versatile">Groq Llama-3.3-70B</option>
-    <option value="groq/llama-3.1-8b-instant">Groq Llama-3.1-8B</option>
-    <option value="groq/mixtral-8x7b-32768">Groq Mixtral-8x7B</option>
-    <option value="openai/gpt-4o">OpenAI GPT-4o</option>
-    <option value="openai/gpt-4o-mini">OpenAI GPT-4o mini</option>
-    <option value="anthropic/claude-3.5-sonnet">Anthropic Claude 3.5 Sonnet</option>
+    <option value="">Default Model</option>
+    <option value="llama-3.3-70b-versatile">Llama-3.3-70B</option>
+    <option value="llama-3.1-8b-instant">Llama-3.1-8B Instant</option>
+    <option value="mixtral-8x7b-32768">Mixtral-8x7B</option>
+    <option value="gemma2-9b-it">Gemma-2-9B</option>
   </select>
   <button class="btn btn-danger" onclick="resetChat()">🗑 Reset</button>
 </div>

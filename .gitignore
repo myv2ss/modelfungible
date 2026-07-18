@@ -3,3 +3,6 @@ __pycache__/
 .pytest_cache/
 *.egg-info/
 .eggs/
+venv/ 
+.env
+examples/chat_poc/.env

@@ -5,94 +5,116 @@
 Chat POC — Proof-of-concept chat application powered by ModelFungible AIP Gateway.
 Demonstrates: streaming, model switching, cost tracking, guardrails, and fallback chains.
 
-Run:
-    cp .env.example .env   # edit with your API keys
+Run standalone (no gateway needed):
+    cp .env.example .env   # edit GROQ_API_KEY
     python3 app.py
+
+Or with the full ModelFungible gateway running on :8765:
+    python3 app.py   # will use gateway automatically
 
 Then open http://localhost:8766
 """
 from __future__ import annotations
 
-import os
-import time
-from datetime import datetime, timezone
-from typing import Optional
-
-from flask import (
-    Flask, render_template, request, Response,
-    stream_with_context, jsonify, session,
-)
+import os, time, json, threading
+from flask import Flask, render_template, request, Response, stream_with_context, jsonify, session
 from dotenv import load_dotenv
 
 load_dotenv()
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", "dev-secret-change-me")
-app.config["JSON_AS_ASCII"] = False
 
-# ── ModelFungible Setup ─────────────────────────────────────────────────────────
-# The magic: swap models without changing a single line of chat logic.
-# The gateway handles routing, fallback, cost, and audit behind the scenes.
+# ── Config ────────────────────────────────────────────────────────────────────
+MF_MODE       = os.environ.get("MF_MODE", "balanced")
+MF_GUARDRAIL  = os.environ.get("MF_GUARDRAIL", "")
+MF_MAX_LEN    = int(os.environ.get("MF_MAX_LEN", "4000"))
+MF_BASE_URL   = os.environ.get("MF_BASE_URL", "")   # empty = use Groq directly
+GROQ_API_KEY  = os.environ.get("GROQ_API_KEY", "")
+DIRECT_MODE   = bool(GROQ_API_KEY and not MF_BASE_URL)
 
-MF_MODE       = os.environ.get("MF_MODE", "balanced")   # fastest | cheapest | balanced
-MF_GUARDRAIL = os.environ.get("MF_GUARDRAIL", "")       # comma-separated blocked terms
-MF_MAX_LEN    = int(os.environ.get("MF_MAX_LEN", "4000"))  # max output chars
+_cost_today = 0.0
+_cost_lock   = threading.Lock()
 
-_cost_today  = 0.0
-_cost_lock   = __import__("threading").Lock()
+# ── Guardrails ────────────────────────────────────────────────────────────────
 
-
-def _build_client():
-    """Build the drop-in OpenAI-compatible client pointing at our gateway."""
-    from modelfungible.core.sdk import ModelFungible
-
-    # Point at our local gateway if it's running, otherwise fall back to direct Groq
-    base_url = os.environ.get("MF_BASE_URL", "http://localhost:8765/api")
-
-    return ModelFungible(
-        base_url=base_url,
-        api_key=os.environ.get("MF_API_KEY", "dev-key"),
-    )
-
-
-def _build_guardrails():
+def _make_guardrails():
+    if not MF_GUARDRAIL and MF_MAX_LEN > 0:
+        return None
     from modelfungible.enterprise.guardrails import Guardrails, GuardrailConfig
     terms = [t.strip() for t in MF_GUARDRAIL.split(",") if t.strip()]
-    if not terms and MF_MAX_LEN >= 0:
-        return None
     cfg = GuardrailConfig(
         blocked_terms=terms,
         max_length=MF_MAX_LEN if MF_MAX_LEN > 0 else None,
     )
     return Guardrails(cfg)
 
-
-def _apply_guardrail(text: str, guardrails) -> tuple[str, bool, str]:
-    """Apply guardrails. Returns (filtered_text, passed, reason)."""
-    if not guardrails:
+def _apply_guardrail(text, g):
+    if not g:
         return text, True, "no_guardrails"
-    r = guardrails.apply(text)
+    r = g.apply(text)
     return r.filtered_output, r.passed, r.reason
 
+# ── Groq direct client (used when no gateway) ────────────────────────────────
 
-# ── Chat History (in-memory per session) ──────────────────────────────────────
+def _groq_stream(messages, model, temperature, max_tokens, api_key):
+    """Yield SSE tokens directly from Groq API."""
+    import urllib.request, urllib.error
+    payload = {
+        "model": model.replace("groq/", ""),
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": True,
+    }
+    req = urllib.request.Request(
+        "https://api.groq.com/openai/v1/chat/completions",
+        data=json.dumps(payload).encode(),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        for line in resp:
+            line = line.decode().strip()
+            if not line or not line.startswith("data: "):
+                continue
+            data = line[6:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+                delta = (
+                    chunk.get("choices", [{}])[0]
+                    .get("delta", {})
+                    .get("content", "")
+                )
+                if delta:
+                    yield delta
+            except Exception:
+                pass
+
+def _groq_cost(model, text):
+    """Rough cost estimate for Groq."""
+    out_toks = max(1, len(text) // 4)
+    # Groq free tier = $0; fall through silently
+    return 0.0
+
+# ── Chat History ───────────────────────────────────────────────────────────────
 
 def get_history():
     if "history" not in session:
         session["history"] = []
     return session["history"]
 
-
-def add_to_history(role: str, content: str, model: str = None,
-                   cost: float = None, latency_ms: int = None,
-                   guardrail_passed: bool = True, guardrail_reason: str = None):
+def add_msg(role, content, model=None, cost=None, latency_ms=None,
+            guardrail_passed=True, guardrail_reason=None):
     msg = {"role": role, "content": content}
-    if model:
-        msg["model"] = model
-    if cost is not None:
-        msg["cost_usd"] = round(cost, 6)
-    if latency_ms is not None:
-        msg["latency_ms"] = latency_ms
+    if model: msg["model"] = model
+    if cost is not None: msg["cost_usd"] = round(cost, 6)
+    if latency_ms is not None: msg["latency_ms"] = latency_ms
     if not guardrail_passed:
         msg["guardrail_flagged"] = True
         msg["guardrail_reason"] = guardrail_reason
@@ -104,17 +126,14 @@ def add_to_history(role: str, content: str, model: str = None,
             global _cost_today
             _cost_today += cost
 
-
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.route("/")
 def index():
     if "history" not in session:
         session["history"] = []
-    return render_template("index.html",
-                           model=os.environ.get("MF_MODEL", "groq/llama-3.3-70b-versatile"),
-                           mode=MF_MODE)
-
+    default_model = os.environ.get("MF_MODEL", "groq/llama-3.3-70b-versatile")
+    return render_template("index.html", model=default_model, mode=MF_MODE)
 
 @app.route("/reset", methods=["POST"])
 def reset_chat():
@@ -122,111 +141,111 @@ def reset_chat():
     session.modified = True
     return "", 204
 
-
 @app.route("/stats", methods=["GET"])
 def stats():
     return jsonify({
         "cost_today": round(_cost_today, 6),
         "mode": MF_MODE,
-        "model": os.environ.get("MF_MODEL", "groq/llama-3.3-70b-versatile"),
+        "direct": DIRECT_MODE,
     })
-
 
 @app.route("/chat", methods=["POST"])
 def chat():
-    """
-    Streaming chat endpoint using the ModelFungible OpenAI-compatible SDK.
-    Switch models by passing ?model=xxx or changing MF_MODEL env var.
-    """
     data = request.get_json() or {}
     user_msg = (data.get("message") or "").strip()
     if not user_msg:
         return jsonify({"error": "message is required"}), 400
 
-    explicit_model = request.args.get("model") or os.environ.get("MF_MODEL", "")
-    guardrails = _build_guardrails()
+    explicit_model = request.args.get("model") or os.environ.get("MF_MODEL", "groq/llama-3.3-70b-versatile")
+    guardrails = _make_guardrails()
 
-    add_to_history("user", user_msg)
+    add_msg("user", user_msg)
 
     def generate():
-        client = _build_client()
-
-        # Build messages
-        messages = [{"role": m["role"], "content": m["content"]} for m in get_history()[:-1]]
-        messages.append({"role": "user", "content": user_msg})
-
-        # Build request kwargs
-        kwargs = {
-            "messages": messages,
-            "stream": True,
-            "temperature": 0.7,
-            "max_tokens": 1024,
-        }
-        if explicit_model:
-            kwargs["model"] = explicit_model
-
-        # Guardrail output filter
-        output_filter = {}
-        if guardrails:
-            output_filter["blocked_terms"] = MF_GUARDRAIL.split(",") if MF_GUARDRAIL else []
-            if MF_MAX_LEN > 0:
-                output_filter["max_length"] = MF_MAX_LEN
-            kwargs["output_filter"] = output_filter
-
         t0 = time.time()
         accumulated = ""
-        model_used = explicit_model or "auto"
+        model_used = explicit_model
         cost_usd = 0.0
         latency_ms = 0
         guardrail_passed = True
         guardrail_reason = ""
 
         try:
-            # The SDK call — same interface as OpenAI, but with gateway superpowers
-            stream = client.chat.completions.create(**kwargs)
+            messages = [{"role": m["role"], "content": m["content"]}
+                        for m in get_history()[:-1]]
+            messages.append({"role": "user", "content": user_msg})
 
-            for chunk in stream:
-                delta = chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content
-                if delta:
+            if DIRECT_MODE or not MF_BASE_URL:
+                # ── Direct Groq (no gateway needed) ────────────────────────
+                for delta in _groq_stream(
+                    messages=messages,
+                    model=explicit_model,
+                    temperature=0.7,
+                    max_tokens=1024,
+                    api_key=GROQ_API_KEY,
+                ):
                     accumulated += delta
-                    # SSE: send delta immediately to browser
                     yield f"data: {delta}\n\n".encode()
+
+            else:
+                # ── Via ModelFungible gateway ──────────────────────────────
+                from modelfungible.core.sdk import ModelFungible
+                client = ModelFungible(
+                    base_url=MF_BASE_URL.rstrip("/"),
+                    api_key=os.environ.get("MF_API_KEY", "dev-key"),
+                )
+                kwargs = {
+                    "messages": messages,
+                    "stream": True,
+                    "temperature": 0.7,
+                    "max_tokens": 1024,
+                }
+                if explicit_model:
+                    kwargs["model"] = explicit_model
+
+                stream = client.chat.completions.create(**kwargs)
+                for chunk in stream:
+                    delta = (
+                        chunk.choices and
+                        chunk.choices[0].delta and
+                        chunk.choices[0].delta.content
+                    )
+                    if delta:
+                        accumulated += delta
+                        yield f"data: {delta}\n\n".encode()
+
+                    # Capture extra fields from gateway
+                    if hasattr(chunk, "_mf_meta"):
+                        meta = chunk._mf_meta
+                        cost_usd   = meta.get("cost_usd", 0)
+                        model_used = meta.get("model_name", model_used)
+                        guardrail_passed = meta.get("guardrail_passed", True)
+                        guardrail_reason = meta.get("guardrail_reason", "")
 
             latency_ms = int((time.time() - t0) * 1000)
 
-            # Extra fields on the response object (not standard OpenAI)
-            if hasattr(stream, "_mf_meta"):
-                meta = stream._mf_meta
-                cost_usd    = meta.get("cost_usd", 0)
-                model_used  = meta.get("model_name", model_used)
-                guardrail_passed = meta.get("guardrail_passed", True)
-                guardrail_reason = meta.get("guardrail_reason", "")
-
-            # Apply guardrails server-side as a fallback
+            # Guardrail filter on accumulated output
             if guardrails and guardrail_passed:
-                filtered, guardrail_passed, guardrail_reason = _apply_guardrail(accumulated, guardrails)
-                if not guardrail_passed:
-                    accumulated = filtered
+                accumulated, guardrail_passed, guardrail_reason = _apply_guardrail(
+                    accumulated, guardrails
+                )
 
         except Exception as e:
             yield f"data: [ERROR] {str(e)}\n\n".encode()
-            add_to_history("assistant", f"Error: {str(e)}",
-                           model=model_used, cost=0, latency_ms=int((time.time()-t0)*1000))
+            add_msg("assistant", f"Error: {str(e)}",
+                    model=model_used, cost=0, latency_ms=int((time.time()-t0)*1000))
             return
 
-        # Cost from response or estimate
+        # Cost estimate for direct Groq (free tier = $0)
         if cost_usd == 0 and accumulated:
-            # rough estimate if not populated
-            toks = len(accumulated) // 4
-            cost_usd = toks / 1000 * 0.0007  # roughest estimate
+            cost_usd = _groq_cost(model_used, accumulated)
 
-        add_to_history(
+        add_msg(
             "assistant", accumulated,
             model=model_used, cost=cost_usd, latency_ms=latency_ms,
             guardrail_passed=guardrail_passed, guardrail_reason=guardrail_reason,
         )
 
-        # Send metadata as final SSE event
         meta = {
             "model": model_used,
             "cost": round(cost_usd, 6),
@@ -235,27 +254,27 @@ def chat():
             "guardrail_reason": guardrail_reason,
             "total_cost_today": round(_cost_today, 6),
         }
-        import json as _json
-        yield f"data: [META] {_json.dumps(meta)}\n\n".encode()
+        yield f"data: [META] {json.dumps(meta)}\n\n".encode()
         yield b"data: [DONE]\n\n"
 
-    resp = Response(
+    return Response(
         stream_with_context(generate()),
         mimetype="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
-        }
+            "X-Accel-Buffering": "no",
+        },
     )
-    return resp
-
 
 if __name__ == "__main__":
     print("=" * 60)
     print("  ModelFungible Chat POC")
     print("  Open http://localhost:8766")
-    print("  Mode:", MF_MODE)
-    print("  Model:", os.environ.get("MF_MODEL", "groq/llama-3.3-70b-versatile"))
-    print("  Guardrail terms:", MF_GUARDRAIL or "(none)")
+    print("=" * 60)
+    print(f"  Mode:         {'Direct Groq (no gateway)' if DIRECT_MODE else 'Via ModelFungible Gateway'}")
+    print(f"  Gateway URL:  {MF_BASE_URL or '(direct Groq)'}")
+    print(f"  Model:        {os.environ.get('MF_MODEL', 'groq/llama-3.3-70b-versatile')}")
+    print(f"  Guardrail:    {MF_GUARDRAIL or '(none)'}")
     print("=" * 60)
     app.run(host="0.0.0.0", port=8766, debug=False, threaded=True)
