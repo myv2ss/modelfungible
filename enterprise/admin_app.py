@@ -29,6 +29,9 @@ try:
     from modelfungible.enterprise.decision_attribution import DecisionStore, ModelScore
     from modelfungible.enterprise.semantic_cache import SemanticCache
     from modelfungible.enterprise.compliance_engine import ComplianceEngine
+    from modelfungible.enterprise.guardrails import Guardrails, GuardrailConfig, build_guardrails_from_dict
+    from modelfungible.enterprise.api_keys import APIKeyStore
+    from modelfungible.enterprise.budget_alerts import BudgetAlertStore
     from modelfungible.enterprise.execute_integration import execute_with_cache_and_compliance, create_streaming_response
     from modelfungible.core.circuit_breaker import CircuitBreaker
     from modelfungible.core.rules_engine import RulesEngine
@@ -42,6 +45,9 @@ except ImportError:
     from enterprise.decision_attribution import DecisionStore, ModelScore
     from enterprise.semantic_cache import SemanticCache
     from enterprise.compliance_engine import ComplianceEngine
+    from enterprise.guardrails import Guardrails, GuardrailConfig, build_guardrails_from_dict
+    from enterprise.api_keys import APIKeyStore
+    from enterprise.budget_alerts import BudgetAlertStore
     from enterprise.execute_integration import execute_with_cache_and_compliance, create_streaming_response
     from core.circuit_breaker import CircuitBreaker
     from core.rules_engine import RulesEngine
@@ -543,6 +549,10 @@ select{cursor:pointer}
     <div class="nav-item" data-tab="decisions" onclick="showTab('decisions')"><span class="icon">🧠</span><span>Decisions</span></div>
     <div class="nav-item" data-tab="prompts" onclick="showTab('prompts')"><span class="icon">📝</span><span>Prompts</span></div>
     <div class="nav-item" data-tab="compliance" onclick="showTab('compliance')"><span class="icon">🛡️</span><span>Compliance</span></div>
+    <div class="nav-item" data-tab="guardrails" onclick="showTab('guardrails')"><span class="icon">🔍</span><span>Guardrails</span></div>
+    <div class="nav-item" data-tab="apikeys" onclick="showTab('apikeys')"><span class="icon">🔑</span><span>API Keys</span></div>
+    <div class="nav-item" data-tab="budget" onclick="showTab('budget')"><span class="icon">💰</span><span>Budget</span></div>
+    <div class="nav-item" data-tab="usage" onclick="showTab('usage')"><span class="icon">📈</span><span>Usage</span></div>
   </div>
   <div class="sidebar-footer">
     <div id="userInfo" style="display:none">
@@ -735,6 +745,124 @@ select{cursor:pointer}
   <div class="card"><h3>License Status</h3><div id="licStatus">Loading...</div></div>
   <div class="card"><h3>System Info</h3><div id="sysInfo">Loading...</div></div>
 </div>
+
+<!-- Guardrails Tab -->
+<div class="tab" id="tab-guardrails">
+  <div class="topbar"><h2>Output Guardrails</h2></div>
+  <div class="card">
+    <h3>Test Guardrail Filter</h3>
+    <textarea id="grTestOutput" placeholder="Paste model output to test..." style="width:100%;height:80px;margin-bottom:8px;background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:8px;font-family:monospace;font-size:12px"></textarea>
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+      <input id="grBlockedTerms" placeholder="Blocked terms (comma-separated)" style="flex:1;background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px">
+      <input id="grMaxLen" type="number" placeholder="Max length" style="width:120px;background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px">
+    </div>
+    <button class="btn btn-primary" onclick="testGuardrail()">Test Filter</button>
+    <div id="grResult" style="margin-top:12px;font-family:monospace;font-size:12px;white-space:pre-wrap;background:var(--input-bg);border:1px solid var(--border);border-radius:6px;padding:10px;min-height:60px;color:var(--text)"></div>
+  </div>
+  <div class="card">
+    <h3>Guardrail Config</h3>
+    <p style="color:var(--text3);font-size:13px">Add <code style="background:var(--card);padding:2px 6px;border-radius:4px">output_filter</code> to your execute request:</p>
+    <pre style="background:var(--input-bg);border:1px solid var(--border);border-radius:6px;padding:12px;font-size:12px;overflow-x:auto;color:var(--text)">{
+  "prompt": "...",
+  "output_filter": {
+    "blocked_terms": ["confidential", "secret", "ssn"],
+    "max_length": 2000,
+    "case_sensitive": false,
+    "mask_replacement": "[FILTERED]"
+  }
+}</pre>
+  </div>
+</div>
+
+<!-- API Keys Tab -->
+<div class="tab" id="tab-apikeys">
+  <div class="topbar"><h2>Per-Team API Keys</h2></div>
+  <div class="card">
+    <h3>Create Team</h3>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr 120px;gap:8px;margin-bottom:8px">
+      <input id="tName" placeholder="Team name" style="background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px">
+      <input id="tDaily" type="number" step="0.01" placeholder="Daily $ limit" style="background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px">
+      <input id="tMonthly" type="number" step="0.01" placeholder="Monthly $ limit" style="background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px">
+      <input id="tRate" type="number" placeholder="RPM (0=unlimited)" style="background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px">
+    </div>
+    <button class="btn btn-primary" onclick="createTeam()">Create Team</button>
+    <div id="tMsg" style="margin-top:8px;font-size:13px"></div>
+  </div>
+  <div class="card">
+    <h3>Teams</h3>
+    <div id="teamsList">Loading...</div>
+  </div>
+  <div class="card">
+    <h3>Create API Key</h3>
+    <div style="display:grid;grid-template-columns:200px 1fr 200px;gap:8px;margin-bottom:8px">
+      <select id="akTeam" style="background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px"><option value="">Select team...</option></select>
+      <input id="akName" placeholder="Key name (e.g. prod-key)" style="background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px">
+      <input id="akSecret" placeholder="HMAC secret (optional)" style="background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px">
+    </div>
+    <button class="btn btn-primary" onclick="createApiKey()">Generate Key</button>
+    <div id="akResult" style="margin-top:10px"></div>
+  </div>
+  <div class="card">
+    <h3>API Keys</h3>
+    <div id="keysList">Loading...</div>
+  </div>
+</div>
+
+<!-- Budget Alerts Tab -->
+<div class="tab" id="tab-budget">
+  <div class="topbar"><h2>Budget Alerts</h2></div>
+  <div class="card">
+    <h3>Create Alert</h3>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr 200px;gap:8px;margin-bottom:8px">
+      <select id="baTeam" style="background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px"><option value="">Select team...</option></select>
+      <input id="baUrl" placeholder="Webhook URL" style="background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px">
+      <input id="baThreshold" type="number" step="1" placeholder="Threshold % (e.g. 80)" value="80" style="background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px">
+      <select id="baType" style="background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px"><option value="daily">Daily</option><option value="monthly">Monthly</option></select>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 200px;gap:8px;margin-bottom:8px">
+      <input id="baDailyLimit" type="number" step="0.01" placeholder="Daily limit ($)" style="background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px">
+      <input id="baMonthlyLimit" type="number" step="0.01" placeholder="Monthly limit ($)" style="background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px">
+      <input id="baSecret" placeholder="HMAC secret (optional)" style="background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px">
+    </div>
+    <button class="btn btn-primary" onclick="createBudgetAlert()">Create Alert</button>
+    <div id="baMsg" style="margin-top:8px;font-size:13px"></div>
+  </div>
+  <div class="card">
+    <h3>Active Alerts</h3>
+    <div id="alertsList">Loading...</div>
+  </div>
+  <div class="card">
+    <h3>Alert History</h3>
+    <div id="alertEvents">Loading...</div>
+  </div>
+</div>
+
+<!-- Usage Tab -->
+<div class="tab" id="tab-usage">
+  <div class="topbar"><h2>Usage &amp; Cost Dashboard</h2></div>
+  <div class="card" style="margin-bottom:16px">
+    <h3>Cost Summary</h3>
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:16px;text-align:center">
+      <div><div style="font-size:24px;font-weight:700;color:var(--accent)" id="uToday">—</div><div style="font-size:11px;color:var(--text3);text-transform:uppercase">Today ($)</div></div>
+      <div><div style="font-size:24px;font-weight:700;color:var(--accent)" id="uMonth">—</div><div style="font-size:11px;color:var(--text3);text-transform:uppercase">This Month ($)</div></div>
+      <div><div style="font-size:24px;font-weight:700;color:var(--blue)" id="uTodayPct">—</div><div style="font-size:11px;color:var(--text3);text-transform:uppercase">Daily % Used</div></div>
+      <div><div style="font-size:24px;font-weight:700;color:var(--blue)" id="uMonthPct">—</div><div style="font-size:11px;color:var(--text3);text-transform:uppercase">Monthly % Used</div></div>
+    </div>
+  </div>
+  <div class="card" style="margin-bottom:16px">
+    <h3>By Team</h3>
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px">
+      <select id="uTeamSel" onchange="loadTeamUsage()" style="background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px"><option value="">All teams</option></select>
+      <select id="uPeriod" onchange="loadTeamUsage()" style="background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px"><option value="today">Today</option><option value="month">This Month</option></select>
+    </div>
+    <div id="usageTable">Loading...</div>
+  </div>
+  <div class="card">
+    <h3>By Model</h3>
+    <div id="modelCostTable">Loading...</div>
+  </div>
+</div>
+
 </main>
 </div>
 </body>
@@ -831,7 +959,7 @@ function hlJson(obj){var s=JSON.stringify(obj,null,2);return s.replace(/("([^"]*
 function showTab(id){document.querySelectorAll(".tab").forEach(function(t){t.classList.remove("active");});document.querySelectorAll(".nav-item").forEach(function(n){n.classList.remove("active");});document.getElementById("tab-"+id).classList.add("active");document.querySelectorAll(".nav-item").forEach(function(n){if(n.dataset.tab===id)n.classList.add("active");});if(id==="dashboard")loadDashboard();else if(id==="strategies")loadStrats();
   else if(id==="decisions"){loadDecisions(0);loadDecStats();}
   else if(id==="prompts"){loadPrompts(0);}
-  else if(id==="execute")initExecute();else if(id==="audit")loadAudit(0);else if(id==="compliance")loadCompliance();else if(id==="deployments")loadDeployments();}
+  else if(id==="execute")initExecute();else if(id==="audit")loadAudit(0);else if(id==="compliance")loadCompliance();else if(id==="deployments")loadDeployments();else if(id==="guardrails"){}else if(id==="apikeys"){loadTeams();loadApiKeys();}else if(id==="budget"){loadTeamsForBudget();loadAlerts();loadAlertEvents();}else if(id==="usage"){loadUsage();loadTeamsForUsage();}}
 async function loadDashboard(){try{var s=await apiGet("/state");var b=await apiGet("/circuit-breakers");document.getElementById("s-total").textContent=s.total_entries||0;document.getElementById("s-today").textContent=s.entries_today||0;document.getElementById("s-models").textContent=s.models?s.models.length:0;document.getElementById("s-breakers").textContent=b.length;try{var v=await apiGet("/audit/verify");var ib=document.getElementById("integrityBadge");ib.className="badge "+(v.valid?"badge-green":"badge-red");ib.textContent=v.valid?"VERIFIED":"TAMPERED";}catch(e){}var mg=document.getElementById("mHealth");document.getElementById("noModels").style.display=(s.models&&s.models.length)?"none":"block";mg.innerHTML="";if(s.models){s.models.forEach(function(m){var n=esc(m.name).replace(/'/g,"\\'");mg.innerHTML+='<div class="model-card"><div class="name">'+esc(m.name)+'</div><div class="meta">'+esc(m.provider)+' / '+esc(m.model_id)+'</div><div class="meta">p50: '+(m.latency_ms_p50||"?")+'ms</div><div class="meta">'+esc(m.capability||"any")+'</div><div class="actions"><button class="btn btn-ghost btn-sm" onclick="testModel(\''+n+'\')">Test</button> <button class="btn btn-danger btn-sm" onclick="deleteModel(\''+n+'\')">Delete</button></div></div>';});}var ct=document.getElementById("cbTable");if(!b.length)ct.innerHTML='<div class="empty">No circuit breakers active.</div>';else{ct.innerHTML='<table><thead><tr><th>Name</th><th>State</th><th>Failures</th><th>Cooldown</th><th></th></tr></thead><tbody>'+b.map(function(x){var n=esc(x.name).replace(/'/g,"\\'");return'<tr><td class="mono">'+esc(x.name)+'</td><td><span class="cb-badge cb-'+(x.state||"CLOSED").toLowerCase().replace("-","")+'">'+esc(x.state||"CLOSED")+'</span></td><td>'+(x.failure_count||0)+'</td><td>'+(x.cooldown_seconds||60)+'s</td><td><button class="btn btn-ghost btn-sm" onclick="resetCb(\''+n+'\')">Reset</button></td></tr>';}).join("")+'</tbody></table>';}try{var logs=await get("/audit/logs?limit=10");var feed=document.getElementById("feed");feed.innerHTML=logs.length?logs.map(function(e){var cls=e.outcome==="success"?"badge-green":e.outcome==="failure"?"badge-red":"badge-yellow";return'<div class="feed-item"><span class="feed-time">'+fmtTs(e.timestamp)+'</span><span class="feed-action">'+esc(e.action)+'</span><span class="feed-actor">'+esc(e.actor||"")+'</span><span class="badge '+cls+'" style="font-size:11px">'+esc(e.outcome||"")+'</span></div>';}).join(""):'<div class="empty">No audit entries yet.</div>';}catch(e){document.getElementById("feed").innerHTML='<div class="empty">Could not load feed.</div>';}}catch(e){console.error(e);}apiGet("/api/version").then(function(v){document.getElementById("verInfo").textContent="v"+(v.modelfungible||"?")+" | Python "+(v.python||"?");}).catch(function(){document.getElementById("verInfo").textContent="ModelFungible Admin";});}
 async function loadDeployments(){try{var s=await apiGet("/state");var t=document.getElementById("mTable");if(!s.models||!s.models.length){t.innerHTML='<div class="empty">No models. Click + Add Model.</div>';return;}t.innerHTML='<table><thead><tr><th>Name</th><th>Provider</th><th>Model ID</th><th>p50</th><th>Capability</th><th></th></tr></thead><tbody>'+s.models.map(function(m){var n=esc(m.name).replace(/'/g,"\\'");return'<tr><td class="mono">'+esc(m.name)+'</td><td>'+esc(m.provider)+'</td><td class="mono">'+esc(m.model_id)+'</td><td>'+(m.latency_ms_p50||"?")+'ms</td><td>'+esc(m.capability||"any")+'</td><td><button class="btn btn-danger btn-sm" onclick="deleteModel(\''+n+'\')">Delete</button></td></tr>';}).join("")+'</tbody></table>';}catch(e){document.getElementById("mTable").innerHTML='<div class="empty">'+esc(e.message)+'</div>';}}
 function showAddForm(){document.getElementById("addForm").style.display="block";document.getElementById("addSuccess").style.display="none";document.getElementById("addErr").style.display="none";}
@@ -894,16 +1022,425 @@ document.getElementById("exMode").addEventListener("change",function(){
   document.getElementById("exCapabilityRow").style.display=(this.value==="capability")?"block":"none";
 });
 window.onload=function(){checkAuth();};
+
+// ── Guardrails ───────────────────────────────────────────────────────────────
+async function testGuardrail(){
+  var output=document.getElementById("grTestOutput").value;
+  var terms=document.getElementById("grBlockedTerms").value.split(",").map(function(t){return t.trim();}).filter(function(t){return t;});
+  var maxLen=parseInt(document.getElementById("grMaxLen").value)||null;
+  if(!output){document.getElementById("grResult").textContent="Paste output to test.";return;}
+  try{
+    var r=await post_("/cache/guardrail-test",{output:output,blocked_terms:terms,max_length:maxLen});
+    var passed=r.passed?"✅ Passed":"❌ Filtered";
+    var cls=r.passed?"color:#4ade80":"color:#f87171";
+    document.getElementById("grResult").innerHTML='<span style="'+cls+';font-weight:600">'+passed+"</span>\n\n"+esc(r.filtered_output)+(r.terms_blocked&&r.terms_blocked.length?'\n\n<span style="color:#f97316">Blocked: '+r.terms_blocked.join(", ")+"</span>":"")+(r.was_truncated?'\n<span style="color:#f97316">Truncated to '+maxLen+' chars</span>':"");
+  }catch(e){document.getElementById("grResult").textContent="Error: "+e.message;}
+}
+
+// ── API Keys ─────────────────────────────────────────────────────────────────
+async function loadTeams(){
+  try{var teams=await get("/api-keys/teams");var sel=document.getElementById("akTeam");sel.innerHTML='<option value="">Select team...</option>'+teams.map(function(t){return'<option value="'+esc(t.team_id)+'">'+esc(t.name)+'</option>';}).join("");
+  document.getElementById("teamsList").innerHTML=!teams.length?'<div class="empty">No teams yet.</div>':'<table><thead><tr><th>Name</th><th>Daily $</th><th>Monthly $</th><th>RPM</th><th>Status</th></tr></thead><tbody>'+teams.map(function(t){var active=t.is_active?'<span class="cb-badge cb-closed">Active</span>':'<span class="cb-badge cb-open">Inactive</span>';return'<tr><td>'+esc(t.name)+'</td><td>'+(t.quota_daily||"unlimited")+'</td><td>'+(t.quota_monthly||"unlimited")+'</td><td>'+(t.rate_limit||"unlimited")+'</td><td>'+active+'</td></tr>';}).join("")+"</tbody></table>";}catch(e){document.getElementById("teamsList").innerHTML='<div class="empty">Error: '+esc(e.message)+'</div>';}
+}
+async function createTeam(){
+  var name=document.getElementById("tName").value.trim();
+  var daily=parseFloat(document.getElementById("tDaily").value)||0;
+  var monthly=parseFloat(document.getElementById("tMonthly").value)||0;
+  var rate=parseInt(document.getElementById("tRate").value)||0;
+  if(!name){document.getElementById("tMsg").innerHTML='<span style="color:#f87171">Name required.</span>';return;}
+  try{var t=await post_("/api-keys/teams",{name:name,quota_daily:daily,quota_monthly:monthly,rate_limit:rate});
+  document.getElementById("tMsg").innerHTML='<span style="color:#4ade80">Team created: '+esc(t.team_id)+'</span>';
+  document.getElementById("tName").value="";loadTeams();loadTeamsForBudget();loadTeamsForUsage();
+  }catch(e){document.getElementById("tMsg").innerHTML='<span style="color:#f87171">'+esc(e.message)+'</span>';}
+}
+async function loadApiKeys(){
+  try{var keys=await get("/api-keys/keys");document.getElementById("keysList").innerHTML=!keys.length?'<div class="empty">No API keys yet.</div>':'<table><thead><tr><th>Name</th><th>Key ID</th><th>Team</th><th>Scopes</th><th>Created</th><th>Last Used</th><th>Status</th><th></th></tr></thead><tbody>'+keys.map(function(k){var active=k.is_active?'<span class="cb-badge cb-closed">Active</span>':'<span class="cb-badge cb-open">Revoked</span>';return'<tr><td>'+esc(k.name)+'</td><td class="mono">'+esc(k.key_id)+'</td><td>'+esc(k.team_id||"")+'</td><td>'+(k.scopes||[]).join(", ")+'</td><td>'+fmtTs(k.created_at)+'</td><td>'+fmtTs(k.last_used||"Never")+'</td><td>'+active+'</td><td><button class="btn btn-danger btn-sm" onclick="revokeKey(\''+esc(k.key_id).replace(/'/g,"\\'")+'\')">Revoke</button></td></tr>';}).join("")+"</tbody></table>";}catch(e){document.getElementById("keysList").innerHTML='<div class="empty">Error: '+esc(e.message)+'</div>';}
+}
+async function createApiKey(){
+  var teamId=document.getElementById("akTeam").value;
+  var name=document.getElementById("akName").value.trim();
+  var secret=document.getElementById("akSecret").value.trim();
+  if(!teamId||!name){document.getElementById("akResult").innerHTML='<span style="color:#f87171">Team and name required.</span>';return;}
+  try{var r=await post_("/api-keys/keys",{team_id:teamId,name:name,secret:secret||undefined});
+  document.getElementById("akResult").innerHTML='<div style="background:var(--input-bg);border:1px solid var(--border);border-radius:6px;padding:12px;margin-top:8px"><div style="color:#f97316;font-weight:600;margin-bottom:4px">⚠️ Save this key now — it will not be shown again!</div><div class="mono" style="font-size:12px;word-break:break-all;color:var(--accent)">'+esc(r.plaintext_key)+'</div><div style="font-size:11px;color:var(--text3);margin-top:4px">Key ID: '+esc(r.key.key_id)+'</div></div>';
+  loadApiKeys();}catch(e){document.getElementById("akResult").innerHTML='<span style="color:#f87171">'+esc(e.message)+'</span>';}
+}
+async function revokeKey(keyId){if(!confirm("Revoke key "+keyId+"?"))return;try{await del__("/api-keys/keys/"+encodeURIComponent(keyId));loadApiKeys();}catch(e){alert("Error: "+e.message);}}
+
+// ── Budget Alerts ─────────────────────────────────────────────────────────────
+async function loadTeamsForBudget(){
+  try{var teams=await get("/api-keys/teams");var sel=document.getElementById("baTeam");sel.innerHTML='<option value="">Select team...</option>'+teams.map(function(t){return'<option value="'+esc(t.team_id)+'">'+esc(t.name)+'</option>';}).join("");}catch(e){}
+}
+async function createBudgetAlert(){
+  var teamId=document.getElementById("baTeam").value;
+  var url=document.getElementById("baUrl").value.trim();
+  var threshold=parseFloat(document.getElementById("baThreshold").value)||80;
+  var type=document.getElementById("baType").value;
+  var dailyLimit=parseFloat(document.getElementById("baDailyLimit").value)||0;
+  var monthlyLimit=parseFloat(document.getElementById("baMonthlyLimit").value)||0;
+  var secret=document.getElementById("baSecret").value.trim();
+  if(!teamId||!url){document.getElementById("baMsg").innerHTML='<span style="color:#f87171">Team and webhook URL required.</span>';return;}
+  try{var a=await post_("/budget-alerts/alerts",{org_id:teamId,webhook_url:url,threshold_pct:threshold,alert_type:type,daily_limit:dailyLimit,monthly_limit:monthlyLimit,secret:secret||undefined});
+  document.getElementById("baMsg").innerHTML='<span style="color:#4ade80">Alert created: '+esc(a.alert_id)+'</span>';
+  document.getElementById("baUrl").value="";loadAlerts();}catch(e){document.getElementById("baMsg").innerHTML='<span style="color:#f87171">'+esc(e.message)+'</span>';}
+}
+async function loadAlerts(){
+  try{var alerts=await get("/budget-alerts/alerts");document.getElementById("alertsList").innerHTML=!alerts.length?'<div class="empty">No alerts configured.</div>':'<table><thead><tr><th>Alert ID</th><th>Org</th><th>Type</th><th>Threshold</th><th>Daily Limit</th><th>Monthly Limit</th><th>Last Fired</th><th>Status</th><th></th></tr></thead><tbody>'+alerts.map(function(a){var en=a.enabled?'<span class="cb-badge cb-closed">Active</span>':'<span class="cb-badge cb-open">Disabled</span>';return'<tr><td class="mono">'+esc(a.alert_id)+'</td><td>'+esc(a.org_id)+'</td><td>'+esc(a.alert_type)+'</td><td>'+a.threshold_pct+'%</td><td>'+(a.daily_limit||"none")+'</td><td>'+(a.monthly_limit||"none")+'</td><td>'+fmtTs(a.last_triggered||"Never")+'</td><td>'+en+'</td><td><button class="btn btn-ghost btn-sm" onclick="toggleAlert(\''+esc(a.alert_id).replace(/'/g,"\\'")+'\','+!a.enabled+')">'+(a.enabled?"Disable":"Enable")+'</button> <button class="btn btn-danger btn-sm" onclick="deleteAlert(\''+esc(a.alert_id).replace(/'/g,"\\'")+'\')">Delete</button></td></tr>';}).join("")+"</tbody></table>";}catch(e){document.getElementById("alertsList").innerHTML='<div class="empty">Error: '+esc(e.message)+'</div>';}
+}
+async function loadAlertEvents(){
+  try{var events=await get("/budget-alerts/events?limit=50");document.getElementById("alertEvents").innerHTML=!events.length?'<div class="empty">No events yet.</div>':'<table><thead><tr><th>Fired At</th><th>Alert ID</th><th>Org</th><th>Type</th><th>Spent</th><th>Limit</th><th>% Used</th><th>Delivery</th></tr></thead><tbody>'+events.map(function(e){var cls=e.delivery_status==="delivered"?"badge-green":e.delivery_status==="failed"?"badge-red":"badge-yellow";return'<tr><td style="white-space:nowrap">'+fmtTs(e.fired_at)+'</td><td class="mono">'+esc(e.alert_id)+'</td><td>'+esc(e.org_id)+'</td><td>'+esc(e.alert_type)+'</td><td>$'+parseFloat(e.spent).toFixed(4)+'</td><td>$'+parseFloat(e.limit_amt).toFixed(2)+'</td><td>'+parseFloat(e.pct_used).toFixed(1)+'%</td><td><span class="badge '+cls+'">'+esc(e.delivery_status||"")+'</span></td></tr>';}).join("")+"</tbody></table>";}catch(e){document.getElementById("alertEvents").innerHTML='<div class="empty">Error: '+esc(e.message)+'</div>';}
+}
+async function toggleAlert(alertId,enable){try{await post_("/budget-alerts/alerts/"+encodeURIComponent(alertId),{enabled:enable});loadAlerts();}catch(e){alert("Error: "+e.message);}}
+async function deleteAlert(alertId){if(!confirm("Delete alert "+alertId+"?"))return;try{await del__("/budget-alerts/alerts/"+encodeURIComponent(alertId));loadAlerts();}catch(e){alert("Error: "+e.message);}}
+
+// ── Usage Dashboard ──────────────────────────────────────────────────────────
+async function loadTeamsForUsage(){
+  try{var teams=await get("/api-keys/teams");var sel=document.getElementById("uTeamSel");sel.innerHTML='<option value="">All teams</option>'+teams.map(function(t){return'<option value="'+esc(t.team_id)+'">'+esc(t.name)+'</option>';}).join("");}catch(e){}
+}
+async function loadUsage(){
+  var teamId=document.getElementById("uTeamSel").value;
+  var period=document.getElementById("uPeriod").value;
+  var endpoint="/cost-stats"+(teamId?"?org_id="+encodeURIComponent(teamId):"");
+  try{
+    var stats=await apiGet(endpoint);
+    var today=stats.today_total||0;var month=stats.month_total||0;
+    var dailyLimit=stats.daily_limit||0;var monthlyLimit=stats.monthly_limit||0;
+    document.getElementById("uToday").textContent="$"+today.toFixed(4);
+    document.getElementById("uMonth").textContent="$"+month.toFixed(4);
+    document.getElementById("uTodayPct").textContent=dailyLimit>0?(today/dailyLimit*100).toFixed(1)+"%":"—";
+    document.getElementById("uMonthPct").textContent=monthlyLimit>0?(month/monthlyLimit*100).toFixed(1)+"%":"—";
+    var byModel=stats.by_model||[];
+    document.getElementById("modelCostTable").innerHTML=!byModel.length?'<div class="empty">No usage data.</div>':'<table><thead><tr><th>Model</th><th>Calls</th><th>Total Cost</th><th>Avg Cost/Call</th></tr></thead><tbody>'+byModel.map(function(m){return'<tr><td class="mono">'+esc(m.model)+'</td><td>'+m.calls+'</td><td>$'+parseFloat(m.cost).toFixed(4)+'</td><td>$'+(m.calls>0?(parseFloat(m.cost)/m.calls).toFixed(4):"0")+'</td></tr>';}).join("")+"</tbody></table>";
+    document.getElementById("usageTable").innerHTML='<div class="empty">Select a team and period above.</div>';
+  }catch(e){document.getElementById("modelCostTable").innerHTML='<div class="empty">Error: '+esc(e.message)+'</div>';}
+}
+async function loadTeamUsage(){
+  var teamId=document.getElementById("uTeamSel").value;
+  if(!teamId){document.getElementById("usageTable").innerHTML='<div class="empty">Select a team.</div>';return;}
+  try{var qs=await get("/api-keys/quota/"+encodeURIComponent(teamId));var period=document.getElementById("uPeriod").value;
+  var spent=period==="today"?qs.spent_today:qs.spent_month;var limit=period==="today"?qs.daily_limit:qs.monthly_limit;
+  var pct=limit>0?(spent/limit*100).toFixed(2)+"%":"unlimited";
+  document.getElementById("usageTable").innerHTML='<table><thead><tr><th>Team</th><th>Spent ('+esc(period)+')</th><th>Limit</th><th>% Used</th><th>Exceeded</th></tr></thead><tbody><tr><td>'+esc(qs.team_id)+'</td><td>$'+parseFloat(spent).toFixed(4)+'</td><td>'+(limit>0?"$"+limit:"unlimited")+'</td><td>'+pct+'</td><td>'+(qs.is_exceeded?'<span class="cb-badge cb-open">YES</span>':'<span class="cb-badge cb-closed">No</span>')+'</td></tr></tbody></table>';}catch(e){document.getElementById("usageTable").innerHTML='<div class="empty">Error: '+esc(e.message)+'</div>';}
+}
+
+window.onload=function(){checkAuth();};
 </script>
 </body>
 </html>
 """
+
+# ─── Shared Store Instances ─────────────────────────────────────────────────────
+_api_key_store = None
+_budget_alert_store = None
+_guardrails_instance = None
+
+
+def _get_api_key_store():
+    global _api_key_store
+    if _api_key_store is None:
+        try:
+            db_path = os.environ.get("MODELFUNGIBLE_API_KEYS_DB", ".modelfungible/api_keys.db")
+            _api_key_store = APIKeyStore(db_path)
+        except Exception as e:
+            print(f"[api_keys] Init failed: {e}")
+    return _api_key_store
+
+
+def _get_budget_alert_store():
+    global _budget_alert_store
+    if _budget_alert_store is None:
+        try:
+            db_path = os.environ.get("MODELFUNGIBLE_BUDGET_DB", ".modelfungible/budget_alerts.db")
+            _budget_alert_store = BudgetAlertStore(db_path)
+        except Exception as e:
+            print(f"[budget_alerts] Init failed: {e}")
+    return _budget_alert_store
+
+
+def _get_guardrails():
+    """Returns the global Guardrails instance (configured via env or default)."""
+    global _guardrails_instance
+    if _guardrails_instance is None:
+        # Load from env: BLOCKED_TERMS=term1,term2;MAX_OUTPUT_LENGTH=2000
+        terms_str = os.environ.get("MODELFUNGIBLE_BLOCKED_TERMS", "")
+        blocked_terms = [t.strip() for t in terms_str.split(",") if t.strip()]
+        max_len_str = os.environ.get("MODELFUNGIBLE_MAX_OUTPUT_LENGTH", "")
+        max_len = int(max_len_str) if max_len_str.isdigit() else None
+        cfg = GuardrailConfig(blocked_terms=blocked_terms, max_length=max_len)
+        _guardrails_instance = Guardrails(cfg)
+    return _guardrails_instance
+
+
+def _get_guardrails_from_request(data: dict) -> Guardrails:
+    """Build per-request guardrails from output_filter in request data."""
+    return build_guardrails_from_dict(data)
+
+
 @app.get("/admin", include_in_schema=False)
 async def admin_ui():
     return HTMLResponse(content=HTML_UI, media_type="text/html")
 
 
+# ─── Guardrail Test Endpoint ───────────────────────────────────────────────────
+@app.post("/api/cache/guardrail-test")
+def api_guardrail_test(data: dict, ctx: AuthContext = require_auth()):
+    """Test guardrail filtering on arbitrary output text."""
+    output = data.get("output", "")
+    blocked = data.get("blocked_terms", [])
+    max_len = data.get("max_length")
+    cfg = GuardrailConfig(blocked_terms=blocked, max_length=max_len)
+    g = Guardrails(cfg)
+    r = g.apply(output)
+    return JSONResponse({
+        "passed": r.passed,
+        "filtered_output": r.filtered_output,
+        "terms_blocked": r.terms_blocked,
+        "was_truncated": r.was_truncated,
+        "reason": r.reason,
+    })
 
-@app.get("/admin", include_in_schema=False)
-async def admin_ui():
-    return HTMLResponse(content=HTML_UI, media_type="text/html")
+
+# ─── API Keys Endpoints ────────────────────────────────────────────────────────
+@app.get("/api-keys/teams")
+def api_list_teams(ctx: AuthContext = require_admin()):
+    store = _get_api_key_store()
+    if store is None:
+        return JSONResponse({"error": "API key store unavailable"}, status_code=503)
+    teams = store.list_teams()
+    return JSONResponse([{
+        "team_id": t.team_id, "name": t.name,
+        "quota_daily": t.quota_daily, "quota_monthly": t.quota_monthly,
+        "rate_limit": t.rate_limit, "is_active": t.is_active,
+        "created_at": t.created_at.isoformat(),
+    } for t in teams])
+
+
+@app.post("/api-keys/teams")
+def api_create_team(data: dict, ctx: AuthContext = require_admin()):
+    store = _get_api_key_store()
+    if store is None:
+        return JSONResponse({"error": "API key store unavailable"}, status_code=503)
+    team = store.create_team(
+        name=data.get("name", "").strip(),
+        quota_daily=float(data.get("quota_daily", 0)),
+        quota_monthly=float(data.get("quota_monthly", 0)),
+        rate_limit=int(data.get("rate_limit", 0)),
+    )
+    return JSONResponse({
+        "team_id": team.team_id, "name": team.name,
+        "quota_daily": team.quota_daily, "quota_monthly": team.quota_monthly,
+        "rate_limit": team.rate_limit, "is_active": team.is_active,
+        "created_at": team.created_at.isoformat(),
+    })
+
+
+@app.get("/api-keys/keys")
+def api_list_keys(ctx: AuthContext = require_admin()):
+    store = _get_api_key_store()
+    if store is None:
+        return JSONResponse({"error": "API key store unavailable"}, status_code=503)
+    keys = store.list_keys()
+    return JSONResponse([{
+        "key_id": k.key_id, "team_id": k.team_id, "name": k.name,
+        "scopes": k.scopes, "is_active": k.is_active,
+        "created_at": k.created_at.isoformat(),
+        "last_used": k.last_used.isoformat() if k.last_used else None,
+        "expires_at": k.expires_at.isoformat() if k.expires_at else None,
+    } for k in keys])
+
+
+@app.post("/api-keys/keys")
+def api_create_key(data: dict, ctx: AuthContext = require_admin()):
+    """Create an API key. Returns plaintext key ONLY once."""
+    store = _get_api_key_store()
+    if store is None:
+        return JSONResponse({"error": "API key store unavailable"}, status_code=503)
+    team_id = data.get("team_id", "").strip()
+    name = data.get("name", "").strip()
+    secret = data.get("secret", "")
+    if not team_id or not name:
+        raise HTTPException(400, "team_id and name are required")
+    try:
+        ak, plaintext = store.create_key(team_id, name, secret=secret or None)
+        return JSONResponse({
+            "key": {
+                "key_id": ak.key_id, "team_id": ak.team_id,
+                "name": ak.name, "scopes": ak.scopes,
+                "created_at": ak.created_at.isoformat(),
+            },
+            "plaintext_key": plaintext,
+        })
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+
+@app.delete("/api-keys/keys/{key_id}")
+def api_revoke_key(key_id: str, ctx: AuthContext = require_admin()):
+    store = _get_api_key_store()
+    if store is None:
+        return JSONResponse({"error": "API key store unavailable"}, status_code=503)
+    ok = store.revoke_key(key_id)
+    return JSONResponse({"revoked": ok})
+
+
+@app.get("/api-keys/quota/{team_id}")
+def api_quota_status(team_id: str, ctx: AuthContext = require_admin()):
+    store = _get_api_key_store()
+    if store is None:
+        return JSONResponse({"error": "API key store unavailable"}, status_code=503)
+    qs = store.get_quota_status(team_id)
+    return JSONResponse({
+        "team_id": qs.team_id,
+        "spent_today": qs.spent_today,
+        "spent_month": qs.spent_month,
+        "daily_limit": qs.daily_limit,
+        "monthly_limit": qs.monthly_limit,
+        "daily_pct": qs.daily_pct,
+        "monthly_pct": qs.monthly_pct,
+        "is_exceeded": qs.is_exceeded,
+        "exceeded_scope": qs.exceeded_scope,
+    })
+
+
+# ─── Budget Alerts Endpoints ───────────────────────────────────────────────────
+@app.get("/budget-alerts/alerts")
+def api_list_alerts(org_id: Optional[str] = None, ctx: AuthContext = require_admin()):
+    store = _get_budget_alert_store()
+    if store is None:
+        return JSONResponse({"error": "Budget alert store unavailable"}, status_code=503)
+    alerts = store.list_alerts(org_id=org_id)
+    return JSONResponse([{
+        "alert_id": a.alert_id,
+        "org_id": a.org_id,
+        "threshold_pct": a.threshold_pct,
+        "webhook_url": a.webhook_url,
+        "alert_type": a.alert_type,
+        "daily_limit": a.daily_limit,
+        "monthly_limit": a.monthly_limit,
+        "enabled": a.enabled,
+        "last_triggered": a.last_triggered.isoformat() if a.last_triggered else None,
+        "created_at": a.created_at.isoformat(),
+    } for a in alerts])
+
+
+@app.post("/budget-alerts/alerts")
+def api_create_alert(data: dict, ctx: AuthContext = require_admin()):
+    store = _get_budget_alert_store()
+    if store is None:
+        return JSONResponse({"error": "Budget alert store unavailable"}, status_code=503)
+    alert = store.create_alert(
+        org_id=data.get("org_id", "default-org"),
+        webhook_url=data.get("webhook_url", ""),
+        threshold_pct=float(data.get("threshold_pct", 80)),
+        alert_type=data.get("alert_type", "daily"),
+        daily_limit=float(data.get("daily_limit", 0)),
+        monthly_limit=float(data.get("monthly_limit", 0)),
+        secret=data.get("secret", ""),
+    )
+    return JSONResponse({
+        "alert_id": alert.alert_id,
+        "org_id": alert.org_id,
+        "threshold_pct": alert.threshold_pct,
+        "webhook_url": alert.webhook_url,
+        "alert_type": alert.alert_type,
+        "enabled": alert.enabled,
+    })
+
+
+@app.post("/budget-alerts/alerts/{alert_id}")
+def api_update_alert(alert_id: str, data: dict, ctx: AuthContext = require_admin()):
+    store = _get_budget_alert_store()
+    if store is None:
+        return JSONResponse({"error": "Budget alert store unavailable"}, status_code=503)
+    updated = store.update_alert(alert_id, **data)
+    if updated is None:
+        raise HTTPException(404, "Alert not found")
+    return JSONResponse({"alert_id": updated.alert_id, "enabled": updated.enabled})
+
+
+@app.delete("/budget-alerts/alerts/{alert_id}")
+def api_delete_alert(alert_id: str, ctx: AuthContext = require_admin()):
+    store = _get_budget_alert_store()
+    if store is None:
+        return JSONResponse({"error": "Budget alert store unavailable"}, status_code=503)
+    ok = store.delete_alert(alert_id)
+    return JSONResponse({"deleted": ok})
+
+
+@app.get("/budget-alerts/events")
+def api_alert_events(
+    org_id: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    ctx: AuthContext = require_admin(),
+):
+    store = _get_budget_alert_store()
+    if store is None:
+        return JSONResponse({"error": "Budget alert store unavailable"}, status_code=503)
+    events = store.get_events(org_id=org_id, limit=limit, offset=offset)
+    return JSONResponse(events)
+
+
+@app.get("/budget-alerts/stats/{alert_id}")
+def api_alert_stats(alert_id: str, ctx: AuthContext = require_admin()):
+    store = _get_budget_alert_store()
+    if store is None:
+        return JSONResponse({"error": "Budget alert store unavailable"}, status_code=503)
+    return JSONResponse(store.get_alert_stats(alert_id))
+
+
+# ─── Usage Dashboard (cost-stats enrichment) ───────────────────────────────────
+@app.get("/api/cost-stats")
+def api_cost_stats(
+    period: str = "day",
+    by: str = "model",
+    org_id: Optional[str] = None,
+    ctx: AuthContext = require_auth(),
+):
+    """Cost statistics — enriched with quota info if API key store available."""
+    from datetime import datetime, timedelta, timezone
+    audit = get_audit_logger()
+    if audit is None:
+        return JSONResponse({"error": "Audit unavailable"}, status_code=503)
+
+    now = datetime.now(timezone.utc)
+    start = (now - timedelta(days=1)).isoformat()
+    entries = audit.query(start_date=start, action="model_execute", limit=100000)
+
+    # Aggregate cost
+    total_cost = 0.0
+    model_costs = {}
+    for e in entries:
+        m = (e.get("model_id") or "unknown")
+        c = float(e.get("cost_usd") or 0)
+        total_cost += c
+        model_costs[m] = model_costs.get(m, 0.0) + c
+
+    today_total = total_cost
+
+    # Monthly
+    month_start = (now - timedelta(days=30)).isoformat()
+    month_entries = audit.query(start_date=month_start, action="model_execute", limit=100000)
+    month_total = sum(float(e.get("cost_usd", 0)) for e in month_entries)
+
+    # Quota status if available
+    daily_limit = 0.0
+    monthly_limit = 0.0
+    if org_id:
+        ks = _get_api_key_store()
+        if ks:
+            qs = ks.get_quota_status(org_id)
+            daily_limit = qs.daily_limit
+            monthly_limit = qs.monthly_limit
+
+    by_model = [{"model": m, "cost": round(c, 6), "calls": sum(1 for e in entries if e.get("model_id") == m)}
+                 for m, c in sorted(model_costs.items(), key=lambda x: -x[1])]
+
+    return JSONResponse({
+        "today_total": round(today_total, 6),
+        "month_total": round(month_total, 6),
+        "daily_limit": daily_limit,
+        "monthly_limit": monthly_limit,
+        "by_model": by_model,
+        "period": period,
+    })
