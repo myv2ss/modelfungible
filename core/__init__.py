@@ -19,6 +19,11 @@ from modelfungible.core.circuit_breaker import (
     call_with_protection,
 )
 from modelfungible.core.session_manager import SessionManager
+from modelfungible.core.execute import (
+    ModelSelector, RouterMode, ModelProfile,
+    ExecutionRequest, estimate_cost, DEFAULT_COSTS,
+)
+from modelfungible.core.sdk import ModelFungible, Anthropic
 
 __all__ = [
     # Core engine
@@ -42,4 +47,14 @@ __all__ = [
     "call_with_protection",
     # Session
     "SessionManager",
+    # Universal LLM Proxy
+    "ModelSelector",
+    "RouterMode",
+    "ModelProfile",
+    "ExecutionRequest",
+    "estimate_cost",
+    "DEFAULT_COSTS",
+    # SDK
+    "ModelFungible",   # OpenAI-compatible drop-in replacement
+    "Anthropic",       # Anthropic SDK-compatible drop-in replacement
 ]

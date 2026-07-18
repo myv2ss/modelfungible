@@ -262,7 +262,19 @@ def get_audit_logger():
             _audit_logger = None
     return _audit_logger
 
+# Import API routers
+try:
+    from modelfungible.enterprise.api_decisions import router_prompts, router_decisions
+except ImportError:
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+    from enterprise.api_decisions import router_prompts, router_decisions
+
 app = FastAPI(title="ModelFungible Enterprise Admin", version="1.0.0")
+
+# Register API routers
+app.include_router(router_prompts)
+app.include_router(router_decisions)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 
@@ -829,6 +841,8 @@ select{cursor:pointer}
     <div class="nav-item" data-tab="strategies" onclick="showTab('strategies')"><span class="icon">⚙️</span><span>Strategies</span></div>
     <div class="nav-item" data-tab="execute" onclick="showTab('execute')"><span class="icon">▶</span><span>Execute</span></div>
     <div class="nav-item" data-tab="audit" onclick="showTab('audit')"><span class="icon">📋</span><span>Audit Logs</span></div>
+    <div class="nav-item" data-tab="decisions" onclick="showTab('decisions')"><span class="icon">🧠</span><span>Decisions</span></div>
+    <div class="nav-item" data-tab="prompts" onclick="showTab('prompts')"><span class="icon">📝</span><span>Prompts</span></div>
     <div class="nav-item" data-tab="compliance" onclick="showTab('compliance')"><span class="icon">🛡️</span><span>Compliance</span></div>
   </div>
   <div class="sidebar-footer">
@@ -944,6 +958,58 @@ select{cursor:pointer}
     </div>
   </div>
 </div>
+<div class="tab" id="tab-decisions">
+  <div class="topbar"><h2>Decision Attribution</h2><div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+    <input id="decSearch" placeholder="Search decisions..." style="padding:6px 10px;background:var(--card2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;width:200px"/>
+    <select id="decMode" style="padding:6px 10px;background:var(--card2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px">
+      <option value="">All modes</option><option value="fastest">Fastest</option><option value="cheapest">Cheapest</option><option value="balanced">Balanced</option><option value="capability">Capability</option>
+    </select>
+    <button class="btn btn-primary btn-sm" onclick="loadDecisions(0)">Search</button>
+  </div></div>
+  <div class="card"><h3>Model Selection History</h3>
+    <div id="decStats" style="margin-bottom:12px;font-size:13px;color:var(--text2)"></div>
+    <div id="decTable"></div>
+    <div class="pagination">
+      <button class="btn btn-ghost btn-sm" id="decPrev" onclick="decPrev()" disabled>Prev</button>
+      <span class="info" id="decInfo"></span>
+      <button class="btn btn-ghost btn-sm" id="decNext" onclick="decNext()" disabled>Next</button>
+    </div>
+  </div>
+  <div class="card" id="decExplainCard" style="display:none"><h3>Decision Explanation</h3>
+    <div id="decExplain" style="white-space:pre-wrap;font-size:13px;line-height:1.6"></div>
+    <div style="margin-top:12px"><h4 style="font-size:12px;color:var(--text2);margin-bottom:8px">Candidate Scores</h4>
+    <div id="decScores"></div></div>
+  </div>
+</div>
+
+<div class="tab" id="tab-prompts">
+  <div class="topbar"><h2>Prompt Marketplace</h2>
+    <div style="display:flex;gap:8px">
+      <select id="prDomain" style="padding:6px 10px;background:var(--card2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px">
+        <option value="">All domains</option><option value="legal">Legal</option><option value="finance">Finance</option><option value="healthcare">Healthcare</option><option value="hr">HR</option><option value="coding">Coding</option><option value="general">General</option>
+      </select>
+      <input id="prSearch" placeholder="Search prompts..." style="padding:6px 10px;background:var(--card2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;width:180px"/>
+      <button class="btn btn-primary btn-sm" onclick="loadPrompts(0)">Search</button>
+      <button class="btn btn-ghost btn-sm" onclick="showNewPromptForm()">+ New Prompt</button>
+    </div>
+  </div>
+  <div id="newPromptForm" class="card" style="display:none"><h3>New Prompt</h3>
+    <div class="form-row"><div class="form-group"><label>Name</label><input id="prName" style="width:100%;padding:8px;background:var(--card2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px"/></div>
+    <div class="form-group"><label>Domain</label><select id="prDomain2" style="width:100%;padding:8px;background:var(--card2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px"><option value="general">General</option><option value="legal">Legal</option><option value="finance">Finance</option><option value="healthcare">Healthcare</option><option value="coding">Coding</option><option value="hr">HR</option></select></div></div>
+    <div class="form-group"><label>Description</label><input id="prDesc" placeholder="What does this prompt do?" style="width:100%;padding:8px;background:var(--card2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px"/></div>
+    <div class="form-group"><label>System Prompt</label><textarea id="prSystem" placeholder="You are a..." style="width:100%;min-height:60px;padding:8px;background:var(--card2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px"></textarea></div>
+    <div class="form-group"><label>Prompt Template (use {"{"}{"{variable_name}"}"})</label><textarea id="prText" placeholder="Review the following {{document_type}} for {{risk_type}} risks..." style="width:100%;min-height:100px;padding:8px;background:var(--card2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px"></textarea></div>
+    <div class="form-group"><label>Tags (comma-separated)</label><input id="prTags" placeholder="legal,contract,review" style="width:100%;padding:8px;background:var(--card2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px"/></div>
+    <button class="btn btn-primary" onclick="createPrompt()">Create Prompt</button>
+  </div>
+  <div id="prList"></div>
+  <div class="pagination">
+    <button class="btn btn-ghost btn-sm" id="prPrev" onclick="prPrev()" disabled>Prev</button>
+    <span class="info" id="prInfo"></span>
+    <button class="btn btn-ghost btn-sm" id="prNext" onclick="prNext()" disabled>Next</button>
+  </div>
+</div>
+
 <div class="tab" id="tab-compliance">
   <div class="topbar"><h2>Compliance &amp; Settings</h2></div>
   <div class="card"><h3>Retention Policy</h3>
@@ -1064,6 +1130,8 @@ function esc(s){if(s==null)return"";return String(s).replace(/&/g,"&amp;").repla
 function fmtTs(ts){if(!ts)return"";try{return new Date(ts).toLocaleString();}catch(e){return ts;}}
 function hlJson(obj){var s=JSON.stringify(obj,null,2);return s.replace(/("([^"]*)"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?/g,function(m){if(/^"/.test(m)){return(/:$/.test(m)?'<span class="json-key">'+m+'</span>':'<span class="json-str">'+m+'</span>');}if(/true|false/.test(m))return'<span class="json-bool">'+m+'</span>';if(/null/.test(m))return'<span class="json-null">'+m+'</span>';return'<span class="json-num">'+m+'</span>';});}
 function showTab(id){document.querySelectorAll(".tab").forEach(function(t){t.classList.remove("active");});document.querySelectorAll(".nav-item").forEach(function(n){n.classList.remove("active");});document.getElementById("tab-"+id).classList.add("active");document.querySelectorAll(".nav-item").forEach(function(n){if(n.dataset.tab===id)n.classList.add("active");});if(id==="dashboard")loadDashboard();else if(id==="strategies")loadStrats();
+  else if(id==="decisions"){loadDecisions(0);loadDecStats();}
+  else if(id==="prompts"){loadPrompts(0);}
   else if(id==="execute")initExecute();else if(id==="audit")loadAudit(0);else if(id==="compliance")loadCompliance();else if(id==="deployments")loadDeployments();}
 async function loadDashboard(){try{var s=await apiGet("/state");var b=await apiGet("/circuit-breakers");document.getElementById("s-total").textContent=s.total_entries||0;document.getElementById("s-today").textContent=s.entries_today||0;document.getElementById("s-models").textContent=s.models?s.models.length:0;document.getElementById("s-breakers").textContent=b.length;try{var v=await apiGet("/audit/verify");var ib=document.getElementById("integrityBadge");ib.className="badge "+(v.valid?"badge-green":"badge-red");ib.textContent=v.valid?"VERIFIED":"TAMPERED";}catch(e){}var mg=document.getElementById("mHealth");document.getElementById("noModels").style.display=(s.models&&s.models.length)?"none":"block";mg.innerHTML="";if(s.models){s.models.forEach(function(m){var n=esc(m.name).replace(/'/g,"\\'");mg.innerHTML+='<div class="model-card"><div class="name">'+esc(m.name)+'</div><div class="meta">'+esc(m.provider)+' / '+esc(m.model_id)+'</div><div class="meta">p50: '+(m.latency_ms_p50||"?")+'ms</div><div class="meta">'+esc(m.capability||"any")+'</div><div class="actions"><button class="btn btn-ghost btn-sm" onclick="testModel(\''+n+'\')">Test</button> <button class="btn btn-danger btn-sm" onclick="deleteModel(\''+n+'\')">Delete</button></div></div>';});}var ct=document.getElementById("cbTable");if(!b.length)ct.innerHTML='<div class="empty">No circuit breakers active.</div>';else{ct.innerHTML='<table><thead><tr><th>Name</th><th>State</th><th>Failures</th><th>Cooldown</th><th></th></tr></thead><tbody>'+b.map(function(x){var n=esc(x.name).replace(/'/g,"\\'");return'<tr><td class="mono">'+esc(x.name)+'</td><td><span class="cb-badge cb-'+(x.state||"CLOSED").toLowerCase().replace("-","")+'">'+esc(x.state||"CLOSED")+'</span></td><td>'+(x.failure_count||0)+'</td><td>'+(x.cooldown_seconds||60)+'s</td><td><button class="btn btn-ghost btn-sm" onclick="resetCb(\''+n+'\')">Reset</button></td></tr>';}).join("")+'</tbody></table>';}try{var logs=await get("/audit/logs?limit=10");var feed=document.getElementById("feed");feed.innerHTML=logs.length?logs.map(function(e){var cls=e.outcome==="success"?"badge-green":e.outcome==="failure"?"badge-red":"badge-yellow";return'<div class="feed-item"><span class="feed-time">'+fmtTs(e.timestamp)+'</span><span class="feed-action">'+esc(e.action)+'</span><span class="feed-actor">'+esc(e.actor||"")+'</span><span class="badge '+cls+'" style="font-size:11px">'+esc(e.outcome||"")+'</span></div>';}).join(""):'<div class="empty">No audit entries yet.</div>';}catch(e){document.getElementById("feed").innerHTML='<div class="empty">Could not load feed.</div>';}}catch(e){console.error(e);}apiGet("/api/version").then(function(v){document.getElementById("verInfo").textContent="v"+(v.modelfungible||"?")+" | Python "+(v.python||"?");}).catch(function(){document.getElementById("verInfo").textContent="ModelFungible Admin";});}
 async function loadDeployments(){try{var s=await apiGet("/state");var t=document.getElementById("mTable");if(!s.models||!s.models.length){t.innerHTML='<div class="empty">No models. Click + Add Model.</div>';return;}t.innerHTML='<table><thead><tr><th>Name</th><th>Provider</th><th>Model ID</th><th>p50</th><th>Capability</th><th></th></tr></thead><tbody>'+s.models.map(function(m){var n=esc(m.name).replace(/'/g,"\\'");return'<tr><td class="mono">'+esc(m.name)+'</td><td>'+esc(m.provider)+'</td><td class="mono">'+esc(m.model_id)+'</td><td>'+(m.latency_ms_p50||"?")+'ms</td><td>'+esc(m.capability||"any")+'</td><td><button class="btn btn-danger btn-sm" onclick="deleteModel(\''+n+'\')">Delete</button></td></tr>';}).join("")+'</tbody></table>';}catch(e){document.getElementById("mTable").innerHTML='<div class="empty">'+esc(e.message)+'</div>';}}

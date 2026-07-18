@@ -16,6 +16,7 @@ from modelfungible.enterprise.audit import (
 )
 
 __all__ = [
+    # Core
     "LicenseKey",
     "LicenseGenerator",
     "OllamaAdapter",
@@ -24,4 +25,9 @@ __all__ = [
     "PIIDetector",
     "ComplianceStamper",
     "RetentionPolicy",
+    # Prompt Marketplace
+    "PromptStore",
+    # Decision Attribution
+    "DecisionStore",
+    "ModelScore",
 ]
