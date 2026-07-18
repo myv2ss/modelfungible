@@ -25,250 +25,28 @@ from fastapi.responses import HTMLResponse, JSONResponse
 try:
     from modelfungible.enterprise.audit import AuditLogger, PIIDetector, RetentionPolicy
     from modelfungible.enterprise.license import LicenseKey
+    from modelfungible.enterprise.prompt_marketplace import PromptStore
+    from modelfungible.enterprise.decision_attribution import DecisionStore, ModelScore
+    from modelfungible.enterprise.semantic_cache import SemanticCache
+    from modelfungible.enterprise.compliance_engine import ComplianceEngine
+    from modelfungible.enterprise.execute_integration import execute_with_cache_and_compliance, create_streaming_response
     from modelfungible.core.circuit_breaker import CircuitBreaker
     from modelfungible.core.rules_engine import RulesEngine
     from modelfungible.core.execute import ModelSelector, RouterMode, ModelProfile, ExecutionRequest, estimate_cost, DEFAULT_COSTS
+    from fastapi.responses import StreamingResponse, JSONResponse as _JR
 except ImportError:
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
     from enterprise.audit import AuditLogger, PIIDetector, RetentionPolicy
     from enterprise.license import LicenseKey
+    from enterprise.prompt_marketplace import PromptStore
+    from enterprise.decision_attribution import DecisionStore, ModelScore
+    from enterprise.semantic_cache import SemanticCache
+    from enterprise.compliance_engine import ComplianceEngine
+    from enterprise.execute_integration import execute_with_cache_and_compliance, create_streaming_response
     from core.circuit_breaker import CircuitBreaker
     from core.rules_engine import RulesEngine
     from core.execute import ModelSelector, RouterMode, ModelProfile, ExecutionRequest, estimate_cost, DEFAULT_COSTS
-
-
-# ─── MULTI-USER AUTH ──────────────────────────────────────────────────────────
-
-@dataclass
-class User:
-    user_id: str
-    name: str
-    role: str          # "admin" | "trader" | "viewer"
-    password_hash: str
-    active: bool = True
-
-    @staticmethod
-    def hashpw(password: str) -> str:
-        return hashlib.sha256(password.encode()).hexdigest()
-
-    def check_password(self, password: str) -> bool:
-        return self.active and secrets.compare_digest(self.password_hash, self.hashpw(password))
-
-
-_DEFAULT_USERS = [
-    User(user_id="admin", name="Administrator", role="admin",
-         password_hash=User.hashpw(os.environ.get("MODELFUNGIBLE_ADMIN_PASSWORD", "changeme"))),
-    User(user_id="trader1", name="Trader One", role="trader",
-         password_hash=User.hashpw("trader123")),
-    User(user_id="viewer1", name="Viewer", role="viewer",
-         password_hash=User.hashpw("viewer123")),
-]
-_user_store: dict[str, User] = {}
-
-def _load_users():
-    global _user_store
-    _user_store = {u.user_id: u for u in _DEFAULT_USERS}
-    env_users = os.environ.get("MODELFUNGIBLE_USERS", "")
-    if env_users:
-        try:
-            for u in json.loads(env_users):
-                _user_store[u["user_id"]] = User(
-                    user_id=u["user_id"], name=u["name"],
-                    role=u.get("role", "viewer"),
-                    password_hash=User.hashpw(u["password"])
-                )
-        except Exception as e:
-            print(f"[auth] MODELFUNGIBLE_USERS parse error: {e}")
-_load_users()
-
-@dataclass
-class Session:
-    session_id: str
-    user_id: str
-    role: str
-    created_at: float
-    expires_at: float
-
-_sessions: dict[str, Session] = {}
-SESSION_TTL_HOURS = 12
-
-def create_session(user: User) -> Session:
-    sid = secrets.token_urlsafe(32)
-    now = time.time()
-    return _sessions.setdefault(sid, Session(
-        session_id=sid, user_id=user.user_id, role=user.role,
-        created_at=now, expires_at=now + SESSION_TTL_HOURS * 3600))
-
-def get_session(sid: str) -> Optional[Session]:
-    s = _sessions.get(sid)
-    if s and time.time() <= s.expires_at:
-        return s
-    _sessions.pop(sid, None)
-    return None
-
-def delete_session(sid: str):
-    _sessions.pop(sid, None)
-
-class AuthContext:
-    def __init__(self, user_id: str, role: str, session_id: str):
-        self.user_id = user_id; self.role = role; self.session_id = session_id
-    def is_admin(self): return self.role == "admin"
-    def is_trader_or_admin(self): return self.role in ("admin", "trader")
-
-def require_auth(x_auth_token: Optional[str] = Header(None)) -> AuthContext:
-    if x_auth_token is None:
-        raise HTTPException(401, {"error": "Login required"})
-    tok = x_auth_token.replace("Bearer ", "")
-    s = get_session(tok)
-    if s is None:
-        raise HTTPException(401, {"error": "Session expired — please login again"})
-    return AuthContext(user_id=s.user_id, role=s.role, session_id=s.session_id)
-
-def require_admin(ctx: AuthContext = None) -> AuthContext:
-    if ctx is None or ctx.role != "admin":
-        raise HTTPException(403, {"error": "Admin role required"})
-    return ctx
-
-def require_trader_or_admin(ctx: AuthContext = None) -> AuthContext:
-    if ctx is None or ctx.role not in ("admin", "trader"):
-        raise HTTPException(403, {"error": "Trader or admin role required"})
-    return ctx
-
-def audit_log(audit, action: str, ctx: AuthContext, outcome: str = "success", **kw):
-    if audit:
-        audit.log(action=action, actor=ctx.user_id, org_id="default-org",
-                  outcome=outcome, metadata=kw)
-
-
-class InMemoryRegistry:
-    def __init__(self):
-        self._models = {}
-        self._breakers = {}
-        self._engines = {}
-
-    def register_model(self, name, provider, model_id, api_key, latency_ms_p50, capability,
-                        cost_input_per_1k=0.001, cost_output_per_1k=0.002):
-        if name in self._models:
-            raise ValueError(f"Model already registered: {name}")
-        # Auto-detect cost from DEFAULT_COSTS if model_id matches
-        for cost_key, costs in DEFAULT_COSTS.items():
-            if cost_key in model_id.lower() or model_id.lower() in cost_key:
-                cost_input_per_1k = costs["input"]
-                cost_output_per_1k = costs["output"]
-                break
-        self._models[name] = {
-            "name": name, "provider": provider, "model_id": model_id,
-            "api_key": api_key, "latency_ms_p50": latency_ms_p50,
-            "capability": capability,
-            "cost_input_per_1k": cost_input_per_1k,
-            "cost_output_per_1k": cost_output_per_1k,
-        }
-        self._breakers[name] = CircuitBreaker(failure_threshold=5, cooldown_seconds=60)
-        return self._models[name]
-
-    def deregister_model(self, name):
-        if name not in self._models:
-            return False
-        del self._models[name]
-        if name in self._breakers:
-            del self._breakers[name]
-        return True
-
-    def list_models(self):
-        out = []
-        for name, m in self._models.items():
-            cb = self._breakers.get(name)
-            state = cb.state() if cb else "CLOSED"
-            health = "healthy" if state == "CLOSED" else ("degraded" if state == "HALF-OPEN" else "circuit_open")
-            out.append({**m, "health": health, "circuit_state": state,
-                         "cost_input_per_1k": m.get("cost_input_per_1k", 0.001),
-                         "cost_output_per_1k": m.get("cost_output_per_1k", 0.002)})
-        return out
-
-    def list_circuit_breakers(self):
-        return [{"model_name": n, "state": self._breakers[n].state(), "failure_count": self._breakers[n]._failure_count}
-                for n in self._models]
-
-    def reset_breaker(self, name):
-        if name not in self._breakers:
-            raise ValueError(f"No breaker for: {name}")
-        self._breakers[name].reset()
-        return {"model_name": name, "state": "CLOSED"}
-
-    def get_engine(self, rules_path):
-        rules_path = os.path.expanduser(rules_path)
-        if rules_path not in self._engines:
-            self._engines[rules_path] = RulesEngine(rules_path)
-        return self._engines[rules_path]
-
-    def list_strategies(self, rules_path):
-        try:
-            return self.get_engine(rules_path).list_strategies()
-        except Exception:
-            return []
-
-    def get_strategy(self, rules_path, sid):
-        try:
-            engine = self.get_engine(rules_path)
-            raw = engine._rules.get(sid)
-            return {"strategy_id": sid, **raw} if raw else None
-        except Exception:
-            return None
-
-    def validate_strategy_json(self, data):
-        errors = []
-        for f in ["strategy_id", "name", "entry_trigger", "sizing"]:
-            if f not in data:
-                errors.append(f"Missing: {f}")
-        s = data.get("sizing", {})
-        if not isinstance(s, dict):
-            errors.append("sizing must be an object")
-        else:
-            for f in ["amount", "max_positions"]:
-                if f not in s:
-                    errors.append(f"sizing.{f} required")
-        return {"valid": len(errors) == 0, "errors": errors}
-
-
-_registry = InMemoryRegistry()
-RULES_PATH = os.environ.get("MODELFUNGIBLE_RULES_PATH",
-    str(Path(__file__).parent.parent / "examples" / "strategies"))
-_audit_dir = os.environ.get("MODELFUNGIBLE_AUDIT_DIR", "/tmp/modelfungible_audit")
-_audit_logger = None
-
-
-def _build_model_profiles(registry):
-    profiles = []
-    for name, m in registry._models.items():
-        cb = registry._breakers.get(name)
-        state = cb.state() if cb else "CLOSED"
-        profiles.append(ModelProfile(
-            name=m["name"], provider=m["provider"], model_id=m["model_id"],
-            api_key=m["api_key"], latency_ms_p50=m.get("latency_ms_p50", 500),
-            capability=m.get("capability", "any"),
-            cost_input_per_1k=m.get("cost_input_per_1k", 0.001),
-            cost_output_per_1k=m.get("cost_output_per_1k", 0.002),
-            failure_count=cb._failure_count if cb else 0,
-            is_available=state != "OPEN",
-        ))
-    return profiles
-
-def get_audit_logger():
-    global _audit_logger
-    if _audit_logger is None:
-        try:
-            _audit_logger = AuditLogger(_audit_dir)
-        except Exception:
-            _audit_logger = None
-    return _audit_logger
-
-# Import API routers
-try:
-    from modelfungible.enterprise.api_decisions import router_prompts, router_decisions
-except ImportError:
-    import sys
-    sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-    from enterprise.api_decisions import router_prompts, router_decisions
+    from fastapi.responses import StreamingResponse, JSONResponse as _JR
 
 app = FastAPI(title="ModelFungible Enterprise Admin", version="1.0.0")
 
@@ -514,170 +292,36 @@ def _get_adapter(registry, model_name):
         return OpenAIAdapter(api_key=key, base_url=p), mid
 
 
+
 @app.post("/api/execute")
 def api_execute(data: dict, ctx: AuthContext = require_trader_or_admin()):
     """
-    Universal LLM proxy: POST /api/execute
-    {
-      "prompt": "string",          # required
-      "system": "string",           # optional, default provided
-      "model": "claude-production", # optional — auto-select if absent
-      "mode": "balanced",           # fastest|cheapest|balanced|capability
-      "capability": "precise",     # code|vision|fast|precise|any
-      "max_cost_per_call": 0.05,  # optional — reject if estimated cost exceeds
-      "temperature": 0.7,         # optional
-      "max_tokens": 1024           # optional
-    }
+    Universal LLM proxy. Set stream=true for SSE streaming.
+    Includes: semantic cache, compliance pre-check, PII redaction, cost tracking.
     """
-    prompt = data.get("prompt", "").strip()
-    if not prompt:
-        raise HTTPException(400, {"error": "prompt is required"})
-
-    system = data.get("system", "You are a helpful assistant.")
-    explicit = data.get("model")
-    mode_str = data.get("mode", "balanced")
-    capability = data.get("capability", "any")
-    max_cost = data.get("max_cost_per_call")
-    temperature = float(data.get("temperature", 0.7))
-    max_tokens = int(data.get("max_tokens", 1024))
-
-    try:
-        router_mode = RouterMode(mode_str)
-    except ValueError:
-        raise HTTPException(400, {"error": f"Invalid mode: {mode_str}. Use: fastest|cheapest|balanced|capability"})
-
-    profiles = _build_model_profiles(_registry)
-    if not profiles:
-        raise HTTPException(503, {"error": "No models registered. Add a model in the Deployments tab."})
-
-    selector = ModelSelector(profiles)
-    req = ExecutionRequest(
-        prompt=prompt, system=system, model=explicit,
-        mode=router_mode, capability=capability,
-        max_cost_per_call=max_cost, temperature=temperature, max_tokens=max_tokens,
+    if data.get("stream", False):
+        return create_streaming_response(
+            data=data, ctx=ctx, registry=_registry,
+            get_audit_logger_fn=get_audit_logger,
+            get_cache_fn=get_cache, get_compliance_fn=get_compliance,
+            build_model_profiles_fn=_build_model_profiles,
+            get_adapter_fn=_get_adapter,
+            RouterMode=RouterMode, ModelSelector=ModelSelector,
+            ModelProfile=ModelProfile, ExecutionRequest=ExecutionRequest,
+            estimate_cost=estimate_cost, PIIDetector=PIIDetector,
+        )
+    result = execute_with_cache_and_compliance(
+        data=data, ctx=ctx, registry=_registry,
+        get_audit_logger_fn=get_audit_logger,
+        get_decision_store_fn=get_decision_store,
+        get_cache_fn=get_cache, get_compliance_fn=get_compliance,
+        build_model_profiles_fn=_build_model_profiles,
+        get_adapter_fn=_get_adapter,
+        RouterMode=RouterMode, ModelSelector=ModelSelector,
+        ModelProfile=ModelProfile, ExecutionRequest=ExecutionRequest,
+        estimate_cost=estimate_cost, PIIDetector=PIIDetector,
     )
-
-    # Pre-check cost cap
-    if max_cost is not None:
-        est_tokens = max(1, len(prompt) // 4) + max_tokens
-        max_model_cost = max((m.cost_input_per_1k for m in profiles), default=0.001)
-        est_cost = est_tokens / 1000 * max_model_cost
-        if est_cost > max_cost:
-            raise HTTPException(402, {"error": f"Estimated cost ${est_cost:.4f} > max_cost_per_call ${max_cost:.4f}"})
-
-    selected = selector.select(req)
-    if not selected:
-        raise HTTPException(503, {"error": "No available model"})
-
-    # PII scan + redact
-    pii_detected = False
-    pii_flags = []
-    prompt_log = prompt
-    system_log = system
-    try:
-        det = PIIDetector()
-        scanned = det.scan({"p": prompt, "s": system})
-        if scanned:
-            pii_detected = True
-            pii_flags = list(scanned.keys())
-            for k, v in scanned.items():
-                if isinstance(v, str):
-                    prompt_log = prompt_log.replace(v, "[REDACTED]")
-                    system_log = system_log.replace(v, "[REDACTED]")
-    except Exception:
-        pass
-
-    # Execute with fallback
-    output_text = ""
-    latency_ms = 0
-    in_tok = max(1, len(prompt) // 4)
-    out_tok = max_tokens // 2
-    cost = 0.0
-    success = False
-    last_err = ""
-    attempt = 1
-
-    fallback = [selected] + selector.get_fallback_order(selected)
-    tried = []
-
-    for candidate in fallback:
-        if candidate.name in tried:
-            continue
-        tried.append(candidate.name)
-        adapter, model_id = _get_adapter(_registry, candidate.name)
-        if not adapter:
-            continue
-        cb = _registry._breakers.get(candidate.name)
-        if cb and cb.state() == "OPEN":
-            last_err = f"Circuit breaker open for {candidate.name}"
-            continue
-        t0 = time.time()
-        try:
-            raw = adapter.call(prompt=prompt_log, model=model_id, system_prompt=system_log,
-                               temperature=temperature, max_tokens=max_tokens)
-            latency_ms = int((time.time() - t0) * 1000)
-            if isinstance(raw, dict):
-                choices = raw.get("choices", [{}])
-                output_text = choices[0].get("message", {}).get("content", "")
-                usage = raw.get("usage", {})
-                in_tok = usage.get("prompt_tokens", in_tok)
-                out_tok = usage.get("completion_tokens", out_tok)
-            else:
-                output_text = str(raw)
-                out_tok = max(out_tok, len(output_text) // 4)
-            cost = estimate_cost(candidate, in_tok, out_tok)
-            success = True
-            if cb:
-                cb.record(success=True)
-            break
-        except Exception as e:
-            last_err = str(e)
-            latency_ms = int((time.time() - t0) * 1000)
-            if cb:
-                cb.record(success=False)
-
-    audit = get_audit_logger()
-    entry_id = ""
-
-    if not success:
-        if audit:
-            entry_id = audit.log(action="model_execute", actor=ctx.user_id,
-                                  org_id="default-org", outcome="error",
-                                  metadata={"router_mode": router_mode.value,
-                                            "capability": capability,
-                                            "models_tried": tried,
-                                            "last_error": last_err,
-                                            "pii_detected": pii_detected})
-        raise HTTPException(503, {"error": f"All models failed. Last: {last_err}"})
-
-    if audit:
-        entry_id = audit.log(action="model_execute", actor=ctx.user_id,
-                              org_id="default-org", outcome="success",
-                              metadata={"router_mode": router_mode.value,
-                                        "capability": capability,
-                                        "model_selected": selected.name,
-                                        "model_id": model_id,
-                                        "latency_ms": latency_ms,
-                                        "cost_usd": cost,
-                                        "input_tokens_est": in_tok,
-                                        "output_tokens_est": out_tok,
-                                        "pii_detected": pii_detected,
-                                        "pii_flags": pii_flags,
-                                        "attempt_number": attempt})
-
-    return JSONResponse({
-        "output": output_text,
-        "model_id": model_id,
-        "model_name": selected.name,
-        "provider": selected.provider,
-        "latency_ms": latency_ms,
-        "cost": round(cost, 6),
-        "router_mode": router_mode.value,
-        "capability": capability,
-        "pii_detected": pii_detected,
-        "attempt_number": attempt,
-        "audit_entry_id": str(entry_id) if entry_id else "",
-    })
+    return _JR(content=json.dumps(result), media_type="application/json")
 
 
 @app.get("/api/cost-stats")
@@ -730,6 +374,61 @@ def api_cost_stats(
                 "by_model": fmt(by_model.items()), "by_user": fmt(by_user.items())}
 
     return JSONResponse({"period": period, "data": data})
+
+
+# ─── COMPLIANCE + CACHE ENDPOINTS ────────────────────────────────────────────────
+
+@app.get("/api/compliance/policies")
+def api_policies(domain: Optional[str]=None, enabled: Optional[bool]=None, ctx: AuthContext=require_auth()):
+    c = get_compliance()
+    if not c: return JSONResponse({"policies":[]})
+    return JSONResponse({"policies":[{"policy_id":p.policy_id,"name":p.name,"domain":p.domain,"enabled":p.enabled,"priority":p.priority,"conditions":p.conditions,"actions":p.actions,"tags":p.tags,"created_by":p.created_by,"created_at":p.created_at} for p in c.list_policies(domain=domain,enabled=enabled)]})
+
+@app.post("/api/compliance/policies")
+def api_create_policy(data: dict, ctx: AuthContext=require_admin()):
+    c = get_compliance()
+    if not c: return JSONResponse({"error":"unavailable"},status_code=503)
+    pol = c.create_policy(name=data["name"],conditions=data.get("conditions",[]),actions=data.get("actions",{"on_fail":"block","on_pass":"allow"}),created_by=ctx.user_id,description=data.get("description",""),domain=data.get("domain","general"),priority=int(data.get("priority",0)),tags=data.get("tags",[]))
+    return JSONResponse({"policy_id":pol.policy_id})
+
+@app.get("/api/compliance/policies/{pid}")
+def api_get_policy(pid: str, ctx: AuthContext=require_auth()):
+    c = get_compliance()
+    if not c: return JSONResponse({})
+    p = c.get_policy(pid)
+    if not p: raise HTTPException(404)
+    return JSONResponse({"policy_id":p.policy_id,"name":p.name,"conditions":p.conditions,"actions":p.actions,"enabled":p.enabled,"priority":p.priority})
+
+@app.delete("/api/compliance/policies/{pid}")
+def api_delete_policy(pid: str, ctx: AuthContext=require_admin()):
+    c = get_compliance()
+    if not c: return JSONResponse({"error":"unavailable"},status_code=503)
+    c.delete_policy(pid)
+    return JSONResponse({"deleted":True})
+
+@app.get("/api/compliance/violations")
+def api_violations(policy_id: Optional[str]=None, actor: Optional[str]=None, start_date: Optional[str]=None, end_date: Optional[str]=None, limit: int=50, offset: int=0, ctx: AuthContext=require_auth()):
+    c = get_compliance()
+    if not c: return JSONResponse({"violations":[]})
+    return JSONResponse({"violations":c.get_violations(policy_id=policy_id,actor=actor,start_date=start_date,end_date=end_date,limit=limit,offset=offset)})
+
+@app.get("/api/compliance/score")
+def api_score(org_id: str="default-org", period_days: int=30, ctx: AuthContext=require_auth()):
+    c = get_compliance()
+    if not c: return JSONResponse({"error":"unavailable"})
+    return JSONResponse(c.get_compliance_score(org_id=org_id,period_days=period_days))
+
+@app.get("/api/cache/stats")
+def api_cache(ctx: AuthContext=require_auth()):
+    cache = get_cache()
+    if not cache: return JSONResponse({"error":"Cache unavailable"})
+    return JSONResponse(cache.stats())
+
+@app.post("/api/cache/clear")
+def api_clear(older_than_days: int=0, ctx: AuthContext=require_admin()):
+    cache = get_cache()
+    if not cache: return JSONResponse({"error":"Cache unavailable"})
+    return JSONResponse({"cleared": cache.clear(older_than_days=older_than_days)})
 
 
 
