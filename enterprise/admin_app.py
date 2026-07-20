@@ -224,6 +224,45 @@ def api_model_delete(name: str, ctx: AuthContext = require_admin()):
         return JSONResponse({"success": True})
     raise HTTPException(404, f"Model not found: {name}")
 
+# Custom LLM Providers
+_custom_providers: dict[str, dict] = {}
+
+@app.get("/api/providers")
+def api_providers_list(ctx: AuthContext = require_admin()):
+    return JSONResponse({"providers": [{"name": n, "base_url": p["base_url"], "api_key": "***" if p.get("api_key") else "", "supports_system_prompt": p.get("supports_system_prompt", True), "default_model": p.get("default_model") or ""} for n, p in _custom_providers.items()]})
+
+@app.post("/api/providers")
+def api_provider_register(data: dict, ctx: AuthContext = require_admin()):
+    for f in ["name", "base_url"]:
+        if not str(data.get(f, "")).strip():
+            raise HTTPException(400, f"Missing: {f}")
+    name = str(data["name"]).strip().lower().replace(" ", "-")
+    if not re.match(r"^[a-z0-9_-]+$", name):
+        raise HTTPException(400, "Name: alphanumeric + dashes/underscores only")
+    _custom_providers[name] = {"name": name, "base_url": str(data["base_url"]).strip().rstrip("/"), "api_key": data.get("api_key", ""), "supports_system_prompt": bool(data.get("supports_system_prompt", True)), "default_model": str(data.get("default_model", "")).strip() or None}
+    return JSONResponse({"success": True, "provider": {"name": name, "base_url": _custom_providers[name]["base_url"], "supports_system_prompt": _custom_providers[name]["supports_system_prompt"], "default_model": _custom_providers[name]["default_model"] or ""}})
+
+@app.delete("/api/providers/{name}")
+def api_provider_delete(name: str, ctx: AuthContext = require_admin()):
+    name = name.lower()
+    if name not in _custom_providers:
+        raise HTTPException(404, f"Provider not found: {name}")
+    del _custom_providers[name]
+    return JSONResponse({"success": True})
+
+@app.post("/api/providers/{name}/test")
+def api_provider_test(name: str, ctx: AuthContext = require_admin()):
+    name = name.lower()
+    if name not in _custom_providers:
+        raise HTTPException(404, f"Provider not found: {name}")
+    p = _custom_providers[name]
+    try:
+        import requests as _req
+        r = _req.get(f"{p['base_url'].rstrip('/')}/models", headers={"Authorization": f"Bearer {p.get('api_key', '')}"}, timeout=10)
+        return JSONResponse({"success": r.status_code < 400, "status_code": r.status_code, "message": "OK" if r.status_code < 400 else r.text[:200]})
+    except Exception as e:
+        return JSONResponse({"success": False, "status_code": 0, "message": str(e)})
+
 @app.get("/api/strategies")
 def api_strategies(ctx: AuthContext = require_auth()):
     return JSONResponse({"strategies": _registry.list_strategies(RULES_PATH)})
@@ -293,6 +332,20 @@ def _get_adapter(registry, model_name):
     elif p == "vertexai":
         from modelfungible.enterprise.adapters.vertexai import VertexAIAdapter
         return VertexAIAdapter(credentials_path=key or None), mid
+    elif p == "minimax":
+        return MiniMaxAdapter(api_key=key), mid
+    elif p in ("moonshot", "kimi"):
+        return MoonshotAdapter(api_key=key), mid
+    elif p == "glm":
+        return GLMAdapter(api_key=key), mid
+    elif p == "owen":
+        return OwenAdapter(api_key=key), mid
+    elif p.startswith("custom:"):
+        cname = p.split(":", 1)[1]
+        if cname in _custom_providers:
+            cp = _custom_providers[cname]
+            return CustomAdapter(provider_name=cname, base_url=cp["base_url"], api_key=cp.get("api_key", ""), supports_system_prompt=cp.get("supports_system_prompt", True), default_model=cp.get("default_model")), mid
+        return None, None
     else:
         from modelfungible.adapters.openai import OpenAIAdapter
         return OpenAIAdapter(api_key=key, base_url=p), mid
@@ -595,7 +648,7 @@ select{cursor:pointer}
     <div class="form-row">
       <div class="form-group"><label>Name</label><input id="mName" placeholder="e.g. claude-primary"/></div>
       <div class="form-group"><label>Provider</label>
-        <select id="mProv"><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="groq">Groq</option><option value="ollama">Ollama (local)</option></select>
+        <select id="mProv" onchange="onProviderChange()"><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="groq">Groq (free tier)</option><option value="minimax">MiniMax</option><option value="moonshot">Moonshot / Kimi</option><option value="glm">GLM / Zhipu AI</option><option value="owen">Owen</option><option value="ollama">Ollama (local)</option><option value="custom">Custom Provider...</option></select>
       </div>
     </div>
     <div class="form-row">
@@ -603,6 +656,7 @@ select{cursor:pointer}
       <div class="form-group"><label>API Key</label><input id="mApiKey" type="password" placeholder="sk-..."/></div>
     </div>
     <div class="form-row">
+      <div class="form-group" id="baseUrlField" style="display:none"><label>Base URL *</label><input id="mBaseUrl" placeholder="https://api.provider.com/v1"/></div>
       <div class="form-group"><label>p50 Latency (ms)</label><input id="mLat" type="number" value="500"/></div>
       <div class="form-group"><label>Capability</label>
         <select id="mCap"><option value="fast">Fast</option><option value="precise">Precise</option><option value="balanced">Balanced</option><option value="any">Any</option></select>
@@ -614,6 +668,29 @@ select{cursor:pointer}
     </div>
   </div>
   <div class="card"><h3>Registered Models</h3><div id="mTable"></div></div>
+  <div class="card" style="border-left:3px solid #60a5fa">
+    <h3>🧩 Custom Providers</h3>
+    <p style="font-size:13px;color:var(--text2);margin-bottom:14px">Connect any LLM — local, intranet, or external. Name + base URL only.</p>
+    <div id="provTable"></div>
+    <button class="btn" style="background:#60a5fa;color:#fff;margin-top:12px" onclick="showAddProvForm()">+ Add Provider</button>
+    <div id="provForm" style="display:none;margin-top:16px;padding-top:16px;border-top:1px solid var(--border)">
+      <h4>New Custom Provider</h4>
+      <div class="ebox" id="provErr"></div>
+      <div class="sbox" id="provSuccess" style="display:none"></div>
+      <div class="form-row" style="margin-top:10px">
+        <div class="form-group"><label>Name</label><input id="pName" placeholder="my-ollama"/></div>
+        <div class="form-group"><label>Base URL</label><input id="pBaseUrl" placeholder="http://localhost:11434/v1"/></div>
+      </div>
+      <div class="form-row">
+        <div class="form-group"><label>API Key</label><input id="pApiKey" type="password" placeholder="empty for local models"/></div>
+        <div class="form-group"><label>Default Model</label><input id="pModel" placeholder="llama-3.3-70b (optional)"/></div>
+      </div>
+      <div style="display:flex;gap:8px;margin-top:10px">
+        <button class="btn" style="background:#60a5fa;color:#fff" onclick="regProvider()">Add Provider</button>
+        <button class="btn btn-ghost" onclick="hideAddProvForm()">Cancel</button>
+      </div>
+    </div>
+  </div>
 </div>
 
 <!-- STRATEGIES -->
@@ -961,10 +1038,17 @@ function showTab(id){document.querySelectorAll(".tab").forEach(function(t){t.cla
   else if(id==="prompts"){loadPrompts(0);}
   else if(id==="execute")initExecute();else if(id==="audit")loadAudit(0);else if(id==="compliance")loadCompliance();else if(id==="deployments")loadDeployments();else if(id==="guardrails"){}else if(id==="apikeys"){loadTeams();loadApiKeys();}else if(id==="budget"){loadTeamsForBudget();loadAlerts();loadAlertEvents();}else if(id==="usage"){loadUsage();loadTeamsForUsage();}}
 async function loadDashboard(){try{var s=await apiGet("/state");var b=await apiGet("/circuit-breakers");document.getElementById("s-total").textContent=s.total_entries||0;document.getElementById("s-today").textContent=s.entries_today||0;document.getElementById("s-models").textContent=s.models?s.models.length:0;document.getElementById("s-breakers").textContent=b.length;try{var v=await apiGet("/audit/verify");var ib=document.getElementById("integrityBadge");ib.className="badge "+(v.valid?"badge-green":"badge-red");ib.textContent=v.valid?"VERIFIED":"TAMPERED";}catch(e){}var mg=document.getElementById("mHealth");document.getElementById("noModels").style.display=(s.models&&s.models.length)?"none":"block";mg.innerHTML="";if(s.models){s.models.forEach(function(m){var n=esc(m.name).replace(/'/g,"\\'");mg.innerHTML+='<div class="model-card"><div class="name">'+esc(m.name)+'</div><div class="meta">'+esc(m.provider)+' / '+esc(m.model_id)+'</div><div class="meta">p50: '+(m.latency_ms_p50||"?")+'ms</div><div class="meta">'+esc(m.capability||"any")+'</div><div class="actions"><button class="btn btn-ghost btn-sm" onclick="testModel(\''+n+'\')">Test</button> <button class="btn btn-danger btn-sm" onclick="deleteModel(\''+n+'\')">Delete</button></div></div>';});}var ct=document.getElementById("cbTable");if(!b.length)ct.innerHTML='<div class="empty">No circuit breakers active.</div>';else{ct.innerHTML='<table><thead><tr><th>Name</th><th>State</th><th>Failures</th><th>Cooldown</th><th></th></tr></thead><tbody>'+b.map(function(x){var n=esc(x.name).replace(/'/g,"\\'");return'<tr><td class="mono">'+esc(x.name)+'</td><td><span class="cb-badge cb-'+(x.state||"CLOSED").toLowerCase().replace("-","")+'">'+esc(x.state||"CLOSED")+'</span></td><td>'+(x.failure_count||0)+'</td><td>'+(x.cooldown_seconds||60)+'s</td><td><button class="btn btn-ghost btn-sm" onclick="resetCb(\''+n+'\')">Reset</button></td></tr>';}).join("")+'</tbody></table>';}try{var logs=await get("/audit/logs?limit=10");var feed=document.getElementById("feed");feed.innerHTML=logs.length?logs.map(function(e){var cls=e.outcome==="success"?"badge-green":e.outcome==="failure"?"badge-red":"badge-yellow";return'<div class="feed-item"><span class="feed-time">'+fmtTs(e.timestamp)+'</span><span class="feed-action">'+esc(e.action)+'</span><span class="feed-actor">'+esc(e.actor||"")+'</span><span class="badge '+cls+'" style="font-size:11px">'+esc(e.outcome||"")+'</span></div>';}).join(""):'<div class="empty">No audit entries yet.</div>';}catch(e){document.getElementById("feed").innerHTML='<div class="empty">Could not load feed.</div>';}}catch(e){console.error(e);}apiGet("/api/version").then(function(v){document.getElementById("verInfo").textContent="v"+(v.modelfungible||"?")+" | Python "+(v.python||"?");}).catch(function(){document.getElementById("verInfo").textContent="ModelFungible Admin";});}
-async function loadDeployments(){try{var s=await apiGet("/state");var t=document.getElementById("mTable");if(!s.models||!s.models.length){t.innerHTML='<div class="empty">No models. Click + Add Model.</div>';return;}t.innerHTML='<table><thead><tr><th>Name</th><th>Provider</th><th>Model ID</th><th>p50</th><th>Capability</th><th></th></tr></thead><tbody>'+s.models.map(function(m){var n=esc(m.name).replace(/'/g,"\\'");return'<tr><td class="mono">'+esc(m.name)+'</td><td>'+esc(m.provider)+'</td><td class="mono">'+esc(m.model_id)+'</td><td>'+(m.latency_ms_p50||"?")+'ms</td><td>'+esc(m.capability||"any")+'</td><td><button class="btn btn-danger btn-sm" onclick="deleteModel(\''+n+'\')">Delete</button></td></tr>';}).join("")+'</tbody></table>';}catch(e){document.getElementById("mTable").innerHTML='<div class="empty">'+esc(e.message)+'</div>';}}
+function onProviderChange(){document.getElementById("baseUrlField").style.display=document.getElementById("mProv").value==="custom"?"block":"none";}
+function showAddProvForm(){document.getElementById("provForm").style.display="block";document.getElementById("provErr").style.display="none";document.getElementById("provSuccess").style.display="none";}
+function hideAddProvForm(){document.getElementById("provForm").style.display="none";}
+async function loadProviders(){try{var r=await apiGet("/providers");var t=document.getElementById("provTable");if(!r.providers||!r.providers.length){t.innerHTML='<div style="font-size:13px;color:var(--text3)">No custom providers yet. Add one below.</div>';return;}t.innerHTML='<table style="width:100%"><thead><tr style="text-align:left;color:var(--text2);font-size:11px;text-transform:uppercase"><th>Name</th><th>Base URL</th><th>Default Model</th><th>Sys</th><th></th></tr></thead><tbody>'+r.providers.map(function(p){var n=esc(p.name).replace(/'/g,"\\'");return'<tr style="border-top:1px solid var(--border)"><td class="mono" style="padding:6px 0">'+esc(p.name)+'</td><td style="padding:6px 0;color:var(--text2);max-width:140px;overflow:hidden;text-overflow:ellipsis">'+esc(p.base_url)+'</td><td style="padding:6px 0;color:var(--text2)">'+(p.default_model||"—")+'</td><td style="padding:6px 0">'+(p.supports_system_prompt?'<span style="color:var(--accent)">✓</span>':'<span style="color:var(--text3)">✗</span>')+'</td><td style="padding:6px 0;text-align:right"><button class="btn btn-sm" style="background:#60a5fa;color:#fff;margin-right:4px" onclick="testProvider(\''+n+'\')">Test</button><button class="btn btn-danger btn-sm" onclick="deleteProvider(\''+n+'\')">✕</button></td></tr>';}).join("")+'</tbody></table>';}catch(e){document.getElementById("provTable").innerHTML='<div class="ebox" style="font-size:13px">'+esc(e.message)+'</div>';}}
+async function regProvider(){var name=document.getElementById("pName").value.trim();var baseUrl=document.getElementById("pBaseUrl").value.trim();if(!name||!baseUrl){document.getElementById("provErr").textContent="Name and Base URL required.";document.getElementById("provErr").style.display="block";return;}try{await apiPost("/providers",{name:name,base_url:baseUrl,api_key:document.getElementById("pApiKey").value,default_model:document.getElementById("pModel").value,supports_system_prompt:true});document.getElementById("provSuccess").textContent="Provider \""+name+"\" added successfully.";document.getElementById("provSuccess").style.display="block";document.getElementById("provErr").style.display="none";setTimeout(function(){hideAddProvForm();loadProviders();},1200);}catch(e){document.getElementById("provErr").textContent="Error: "+e.message;document.getElementById("provErr").style.display="block";}}
+async function deleteProvider(name){if(!confirm("Delete provider \""+name+"\"?"))return;try{await apiDelete("/providers/"+name);loadProviders();}catch(e){alert("Error: "+e.message);}}
+async function testProvider(name){try{var r=await apiPost("/providers/"+name+"/test",{});alert(r.success?"✓ Connected ("+r.status_code+")":"✗ Failed: "+r.message);}catch(e){alert("Error: "+e.message);}}
+async function loadDeployments(){try{Promise.all([loadProviders()]);var s=await apiGet("/state");var t=document.getElementById("mTable");if(!s.models||!s.models.length){t.innerHTML='<div class="empty">No models. Click + Add Model.</div>';return;}t.innerHTML='<table><thead><tr><th>Name</th><th>Provider</th><th>Model ID</th><th>p50</th><th>Capability</th><th></th></tr></thead><tbody>'+s.models.map(function(m){var n=esc(m.name).replace(/'/g,"\\'");return'<tr><td class="mono">'+esc(m.name)+'</td><td>'+esc(m.provider)+'</td><td class="mono">'+esc(m.model_id)+'</td><td>'+(m.latency_ms_p50||"?")+'ms</td><td>'+esc(m.capability||"any")+'</td><td><button class="btn btn-danger btn-sm" onclick="deleteModel(\''+n+'\')">Delete</button></td></tr>';}).join("")+'</tbody></table>';}catch(e){document.getElementById("mTable").innerHTML='<div class="empty">'+esc(e.message)+'</div>';}}
 function showAddForm(){document.getElementById("addForm").style.display="block";document.getElementById("addSuccess").style.display="none";document.getElementById("addErr").style.display="none";}
 function hideAddForm(){document.getElementById("addForm").style.display="none";}
-async function regModel(){var name=document.getElementById("mName").value.trim();var modelId=document.getElementById("mModelId").value.trim();if(!name||!modelId){var e=document.getElementById("addErr");e.textContent="Name and Model ID are required.";e.style.display="block";return;}try{await apiPost("/models/register",{name:name,provider:document.getElementById("mProv").value,model_id:modelId,api_key:document.getElementById("mApiKey").value,latency_ms_p50:parseInt(document.getElementById("mLat").value)||500,capability:document.getElementById("mCap").value});var s=document.getElementById("addSuccess");s.textContent="Model registered successfully.";s.style.display="block";document.getElementById("addErr").style.display="none";setTimeout(function(){hideAddForm();loadDeployments();loadDashboard();},1000);}catch(e){var err=document.getElementById("addErr");err.textContent="Error: "+e.message;err.style.display="block";}}
+async function regModel(){var name=document.getElementById("mName").value.trim();var modelId=document.getElementById("mModelId").value.trim();if(!name||!modelId){var e=document.getElementById("addErr");e.textContent="Name and Model ID are required.";e.style.display="block";return;}try{var _prov=document.getElementById("mProv").value;if(_prov==="custom"){var _bu=document.getElementById("mBaseUrl").value.trim();if(!_bu){document.getElementById("addErr").textContent="Base URL required for custom.";document.getElementById("addErr").style.display="block";return;}_prov="custom:"+_bu;}await apiPost("/models/register",{name:name,provider:_prov,model_id:modelId,api_key:document.getElementById("mApiKey").value,latency_ms_p50:parseInt(document.getElementById("mLat").value)||500,capability:document.getElementById("mCap").value});var s=document.getElementById("addSuccess");s.textContent="Model registered successfully.";s.style.display="block";document.getElementById("addErr").style.display="none";setTimeout(function(){hideAddForm();loadDeployments();loadDashboard();},1000);}catch(e){var err=document.getElementById("addErr");err.textContent="Error: "+e.message;err.style.display="block";}}
 async function deleteModel(name){if(!confirm("Delete model \""+name+"\"?"))return;try{await fetch(API+"/models/"+encodeURIComponent(name));loadDeployments();loadDashboard();}catch(e){alert("Error: "+e.message);}}
 async function testModel(name){try{await apiPost("/models/"+encodeURIComponent(name)+"/test",{});alert("Test passed for "+name);}catch(e){alert("Test failed: "+e.message);}}
 async function resetCb(name){try{await apiPost("/circuit-breakers/"+encodeURIComponent(name)+"/reset",{});loadDashboard();}catch(e){alert("Error: "+e.message);}}
