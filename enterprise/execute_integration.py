@@ -32,6 +32,7 @@ def execute_with_cache_and_compliance(
     get_audit_logger_fn, get_decision_store_fn,
     get_cache_fn, get_compliance_fn, get_guardrails_fn,
     get_api_key_store_fn, get_budget_alert_store_fn,
+    get_distillation_fn,
     build_model_profiles_fn, get_adapter_fn,
     RouterMode, ModelSelector, ModelProfile, ExecutionRequest,
     estimate_cost, PIIDetector,
@@ -100,6 +101,37 @@ def execute_with_cache_and_compliance(
                     "error": "Policy violation", "policy": pr.policy_name,
                     "failed_conditions": pr.failed_conditions, "details": pr.details,
                 })
+
+    # ── 2b. Distillation detection ───────────────────────────────────────
+    distillation = get_distillation_fn()
+    if distillation:
+        user_id = getattr(ctx, "user_id", "anonymous")
+        is_paid = getattr(ctx, "role", "user") in ("admin", "enterprise")
+        is_auth = True
+        tokens_est = int(data.get("max_tokens", 1024)) or 512
+        d_result = distillation.check(
+            user_id, prompt,
+            session_history=[],
+            is_paid_tier=is_paid,
+            is_authenticated=is_auth,
+            tokens=tokens_est,
+        )
+        if d_result.recommendation in ("flag", "slowdown"):
+            audit = get_audit_logger_fn()
+            if audit:
+                audit.log(
+                    action="distillation_detected",
+                    actor=user_id,
+                    org_id=org_id,
+                    outcome="flagged",
+                    metadata={
+                        "risk_score": d_result.risk_score,
+                        "signals": d_result.signals,
+                        "recommendation": d_result.recommendation,
+                        "slowdown": d_result.slowdown_multiplier,
+                        "prompt_hash": hash(prompt) % 10**10,
+                    },
+                )
 
     # ── 3. Cache lookup ───────────────────────────────────────────────────
     cache = get_cache_fn()
@@ -362,6 +394,7 @@ def create_streaming_response(
     data, ctx, registry,
     get_audit_logger_fn, get_cache_fn, get_compliance_fn, get_guardrails_fn,
     get_budget_alert_store_fn, get_api_key_store_fn,
+    get_distillation_fn,
     build_model_profiles_fn, get_adapter_fn,
     RouterMode, ModelSelector, ModelProfile, ExecutionRequest,
     estimate_cost, PIIDetector,
@@ -441,7 +474,7 @@ def create_streaming_response(
                     content = str(raw)
                 words = content.split(" ")
                 for i, word in enumerate(words):
-                    delta = word + (" " if i                    delta = word + (" " if i < len(words) - 1 else "")
+                    delta = word + (" " if i < len(words) - 1 else "")
                     accumulated += delta
                     yield f"data: {_json.dumps({'type': 'delta', 'delta': delta})}\n\n"
         except Exception as e:

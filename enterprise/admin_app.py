@@ -46,6 +46,8 @@ except ImportError:
     from enterprise.semantic_cache import SemanticCache
     from enterprise.compliance_engine import ComplianceEngine
     from enterprise.guardrails import Guardrails, GuardrailConfig, build_guardrails_from_dict
+    from enterprise.distillation_detector import DistillationDetector
+    from enterprise.distillation_detector import DistillationDetector
     from enterprise.api_keys import APIKeyStore
     from enterprise.budget_alerts import BudgetAlertStore
     from enterprise.execute_integration import execute_with_cache_and_compliance, create_streaming_response
@@ -363,6 +365,10 @@ def api_execute(data: dict, ctx: AuthContext = require_trader_or_admin()):
             data=data, ctx=ctx, registry=_registry,
             get_audit_logger_fn=get_audit_logger,
             get_cache_fn=get_cache, get_compliance_fn=get_compliance,
+            get_guardrails_fn=_get_guardrails,
+            get_api_key_store_fn=_get_api_key_store,
+            get_budget_alert_store_fn=_get_budget_alert_store,
+            get_distillation_fn=_get_distillation,
             build_model_profiles_fn=_build_model_profiles,
             get_adapter_fn=_get_adapter,
             RouterMode=RouterMode, ModelSelector=ModelSelector,
@@ -374,6 +380,10 @@ def api_execute(data: dict, ctx: AuthContext = require_trader_or_admin()):
         get_audit_logger_fn=get_audit_logger,
         get_decision_store_fn=get_decision_store,
         get_cache_fn=get_cache, get_compliance_fn=get_compliance,
+        get_guardrails_fn=_get_guardrails,
+        get_api_key_store_fn=_get_api_key_store,
+        get_budget_alert_store_fn=_get_budget_alert_store,
+        get_distillation_fn=_get_distillation,
         build_model_profiles_fn=_build_model_profiles,
         get_adapter_fn=_get_adapter,
         RouterMode=RouterMode, ModelSelector=ModelSelector,
@@ -490,6 +500,59 @@ def api_clear(older_than_days: int=0, ctx: AuthContext=require_admin()):
     return JSONResponse({"cleared": cache.clear(older_than_days=older_than_days)})
 
 
+# ─── DISTILLATION DETECTION ───────────────────────────────────────────────────
+
+@app.get("/api/distillation/stats")
+def api_distillation_stats(ctx: AuthContext=require_auth()):
+    """Get overall distillation detection statistics."""
+    d = _get_distillation()
+    stats = {
+        "monitored_users": len(d._metrics),
+        "high_risk_users": len(d.get_all_high_risk_users()),
+        "total_flagged_requests": sum(m.extraction_hits for m in d._metrics.values()),
+    }
+    return JSONResponse(stats)
+
+
+@app.get("/api/distillation/users/{user_id}")
+def api_distillation_user(user_id: str, ctx: AuthContext=require_auth()):
+    """Get distillation stats for a specific user."""
+    d = _get_distillation()
+    stats = d.get_stats(user_id)
+    if stats["total_requests"] == 0:
+        return JSONResponse({"error": "User not found"}, status_code=404)
+    return JSONResponse(stats)
+
+
+@app.post("/api/distillation/users/{user_id}/reset")
+def api_distillation_reset(user_id: str, ctx: AuthContext=require_admin()):
+    """Reset distillation metrics for a user (admin only)."""
+    d = _get_distillation()
+    d.reset_user(user_id)
+    return JSONResponse({"ok": True, "user_id": user_id})
+
+
+@app.get("/api/distillation/high-risk-users")
+def api_distillation_high_risk(ctx: AuthContext=require_auth()):
+    """Get all high-risk users flagged for potential distillation."""
+    d = _get_distillation()
+    return JSONResponse({"users": d.get_all_high_risk_users()})
+
+
+@app.post("/api/distillation/check")
+def api_distillation_check(data: dict, ctx: AuthContext=require_auth()):
+    """Manually check a prompt for distillation risk (for testing/admin review)."""
+    d = _get_distillation()
+    user_id = data.get("user_id", ctx.user_id)
+    prompt = data.get("prompt", "")
+    session_history = data.get("session_history", [])
+    is_paid = data.get("is_paid_tier", False)
+    is_authenticated = data.get("is_authenticated", True)
+    tokens = data.get("tokens", 0)
+    result = d.check(user_id, prompt, session_history=session_history,
+                     is_paid_tier=is_paid, is_authenticated=is_authenticated, tokens=tokens)
+    return JSONResponse(result.to_dict())
+
 
 HTML_UI = """<!DOCTYPE html>
 <html lang="en">
@@ -603,6 +666,7 @@ select{cursor:pointer}
     <div class="nav-item" data-tab="prompts" onclick="showTab('prompts')"><span class="icon">📝</span><span>Prompts</span></div>
     <div class="nav-item" data-tab="compliance" onclick="showTab('compliance')"><span class="icon">🛡️</span><span>Compliance</span></div>
     <div class="nav-item" data-tab="guardrails" onclick="showTab('guardrails')"><span class="icon">🔍</span><span>Guardrails</span></div>
+    <div class="nav-item" data-tab="distillation" onclick="showTab('distillation')"><span class="icon">🔬</span><span>Distillation</span></div>
     <div class="nav-item" data-tab="apikeys" onclick="showTab('apikeys')"><span class="icon">🔑</span><span>API Keys</span></div>
     <div class="nav-item" data-tab="budget" onclick="showTab('budget')"><span class="icon">💰</span><span>Budget</span></div>
     <div class="nav-item" data-tab="usage" onclick="showTab('usage')"><span class="icon">📈</span><span>Usage</span></div>
@@ -851,6 +915,48 @@ select{cursor:pointer}
   </div>
 </div>
 
+<!-- Distillation Detection Tab -->
+<div class="tab" id="tab-distillation">
+  <div class="topbar"><h2>Distillation Detection</h2></div>
+  <div class="card">
+    <h3>Overview</h3>
+    <div id="distillationStats" style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:8px">
+      <div class="stat-box"><div class="stat-num" id="dist-monitored">-</div><div class="stat-label">Monitored Users</div></div>
+      <div class="stat-box"><div class="stat-num" id="dist-high-risk">-</div><div class="stat-label">High Risk</div></div>
+      <div class="stat-box"><div class="stat-num" id="dist-flagged">-</div><div class="stat-label">Flagged Requests</div></div>
+    </div>
+    <button class="btn btn-primary" onclick="loadDistillationStats()">Refresh</button>
+  </div>
+  <div class="card">
+    <h3>Manual Check</h3>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">
+      <input id="dist-user" placeholder="User ID" style="background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px">
+      <input id="dist-tokens" type="number" placeholder="Tokens (optional)" style="background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px">
+    </div>
+    <textarea id="dist-prompt" placeholder="Prompt to check..." style="width:100%;height:70px;margin-bottom:8px;background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:8px;font-family:monospace;font-size:12px"></textarea>
+    <div style="display:flex;gap:8px;margin-bottom:8px">
+      <label style="display:flex;align-items:center;gap:4px;color:var(--text2);font-size:13px"><input id="dist-paid" type="checkbox"> Paid tier</label>
+      <label style="display:flex;align-items:center;gap:4px;color:var(--text2);font-size:13px"><input id="dist-auth" type="checkbox" checked> Authenticated</label>
+    </div>
+    <button class="btn btn-primary" onclick="checkDistillation()">Check Prompt</button>
+    <div id="dist-check-result" style="margin-top:12px;font-family:monospace;font-size:12px;white-space:pre-wrap;background:var(--input-bg);border:1px solid var(--border);border-radius:6px;padding:10px;min-height:60px;color:var(--text)"></div>
+  </div>
+  <div class="card">
+    <h3>High-Risk Users</h3>
+    <div id="dist-high-risk-list" style="color:var(--text2);font-size:13px">Loading...</div>
+    <button class="btn btn-secondary" onclick="loadHighRiskUsers()" style="margin-top:8px">Refresh</button>
+  </div>
+  <div class="card">
+    <h3>User Lookup</h3>
+    <div style="display:flex;gap:8px;margin-bottom:8px">
+      <input id="dist-lookup-user" placeholder="User ID" style="flex:1;background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px">
+      <button class="btn btn-primary" onclick="lookupDistillationUser()">Lookup</button>
+      <button class="btn btn-danger" onclick="resetDistillationUser()">Reset (Admin)</button>
+    </div>
+    <div id="dist-user-result" style="font-family:monospace;font-size:12px;white-space:pre-wrap;background:var(--input-bg);border:1px solid var(--border);border-radius:6px;padding:10px;min-height:80px;color:var(--text)"></div>
+  </div>
+</div>
+
 <!-- API Keys Tab -->
 <div class="tab" id="tab-apikeys">
   <div class="topbar"><h2>Per-Team API Keys</h2></div>
@@ -1036,7 +1142,7 @@ function hlJson(obj){var s=JSON.stringify(obj,null,2);return s.replace(/("([^"]*
 function showTab(id){document.querySelectorAll(".tab").forEach(function(t){t.classList.remove("active");});document.querySelectorAll(".nav-item").forEach(function(n){n.classList.remove("active");});document.getElementById("tab-"+id).classList.add("active");document.querySelectorAll(".nav-item").forEach(function(n){if(n.dataset.tab===id)n.classList.add("active");});if(id==="dashboard")loadDashboard();else if(id==="strategies")loadStrats();
   else if(id==="decisions"){loadDecisions(0);loadDecStats();}
   else if(id==="prompts"){loadPrompts(0);}
-  else if(id==="execute")initExecute();else if(id==="audit")loadAudit(0);else if(id==="compliance")loadCompliance();else if(id==="deployments")loadDeployments();else if(id==="guardrails"){}else if(id==="apikeys"){loadTeams();loadApiKeys();}else if(id==="budget"){loadTeamsForBudget();loadAlerts();loadAlertEvents();}else if(id==="usage"){loadUsage();loadTeamsForUsage();}}
+  else if(id==="execute")initExecute();else if(id==="audit")loadAudit(0);else if(id==="compliance")loadCompliance();else if(id==="deployments")loadDeployments();else if(id==="guardrails"){}else if(id==="distillation"){loadDistillationStats();}else if(id==="apikeys"){loadTeams();loadApiKeys();}else if(id==="budget"){loadTeamsForBudget();loadAlerts();loadAlertEvents();}else if(id==="usage"){loadUsage();loadTeamsForUsage();}}
 async function loadDashboard(){try{var s=await apiGet("/state");var b=await apiGet("/circuit-breakers");document.getElementById("s-total").textContent=s.total_entries||0;document.getElementById("s-today").textContent=s.entries_today||0;document.getElementById("s-models").textContent=s.models?s.models.length:0;document.getElementById("s-breakers").textContent=b.length;try{var v=await apiGet("/audit/verify");var ib=document.getElementById("integrityBadge");ib.className="badge "+(v.valid?"badge-green":"badge-red");ib.textContent=v.valid?"VERIFIED":"TAMPERED";}catch(e){}var mg=document.getElementById("mHealth");document.getElementById("noModels").style.display=(s.models&&s.models.length)?"none":"block";mg.innerHTML="";if(s.models){s.models.forEach(function(m){var n=esc(m.name).replace(/'/g,"\\'");mg.innerHTML+='<div class="model-card"><div class="name">'+esc(m.name)+'</div><div class="meta">'+esc(m.provider)+' / '+esc(m.model_id)+'</div><div class="meta">p50: '+(m.latency_ms_p50||"?")+'ms</div><div class="meta">'+esc(m.capability||"any")+'</div><div class="actions"><button class="btn btn-ghost btn-sm" onclick="testModel(\''+n+'\')">Test</button> <button class="btn btn-danger btn-sm" onclick="deleteModel(\''+n+'\')">Delete</button></div></div>';});}var ct=document.getElementById("cbTable");if(!b.length)ct.innerHTML='<div class="empty">No circuit breakers active.</div>';else{ct.innerHTML='<table><thead><tr><th>Name</th><th>State</th><th>Failures</th><th>Cooldown</th><th></th></tr></thead><tbody>'+b.map(function(x){var n=esc(x.name).replace(/'/g,"\\'");return'<tr><td class="mono">'+esc(x.name)+'</td><td><span class="cb-badge cb-'+(x.state||"CLOSED").toLowerCase().replace("-","")+'">'+esc(x.state||"CLOSED")+'</span></td><td>'+(x.failure_count||0)+'</td><td>'+(x.cooldown_seconds||60)+'s</td><td><button class="btn btn-ghost btn-sm" onclick="resetCb(\''+n+'\')">Reset</button></td></tr>';}).join("")+'</tbody></table>';}try{var logs=await get("/audit/logs?limit=10");var feed=document.getElementById("feed");feed.innerHTML=logs.length?logs.map(function(e){var cls=e.outcome==="success"?"badge-green":e.outcome==="failure"?"badge-red":"badge-yellow";return'<div class="feed-item"><span class="feed-time">'+fmtTs(e.timestamp)+'</span><span class="feed-action">'+esc(e.action)+'</span><span class="feed-actor">'+esc(e.actor||"")+'</span><span class="badge '+cls+'" style="font-size:11px">'+esc(e.outcome||"")+'</span></div>';}).join(""):'<div class="empty">No audit entries yet.</div>';}catch(e){document.getElementById("feed").innerHTML='<div class="empty">Could not load feed.</div>';}}catch(e){console.error(e);}apiGet("/api/version").then(function(v){document.getElementById("verInfo").textContent="v"+(v.modelfungible||"?")+" | Python "+(v.python||"?");}).catch(function(){document.getElementById("verInfo").textContent="ModelFungible Admin";});}
 function onProviderChange(){document.getElementById("baseUrlField").style.display=document.getElementById("mProv").value==="custom"?"block":"none";}
 function showAddProvForm(){document.getElementById("provForm").style.display="block";document.getElementById("provErr").style.display="none";document.getElementById("provSuccess").style.display="none";}
@@ -1208,6 +1314,13 @@ async function loadTeamUsage(){
 }
 
 window.onload=function(){checkAuth();};
+
+async function loadDistillationStats(){try{var r=await apiGet("/distillation/stats");document.getElementById("dist-monitored").textContent=r.monitored_users||0;document.getElementById("dist-high-risk").textContent=r.high_risk_users||0;document.getElementById("dist-flagged").textContent=r.total_flagged_requests||0;loadHighRiskUsers();}catch(e){console.error(e);}}
+async function loadHighRiskUsers(){try{var r=await apiGet("/distillation/high-risk-users");var el=document.getElementById("dist-high-risk-list");if(!r.users||!r.users.length){el.innerHTML='<div class="empty">No high-risk users detected.</div>';return;}el.innerHTML='<table style="width:100%;font-size:13px"><thead><tr style="text-align:left;color:var(--text2);font-size:11px;text-transform:uppercase"><th>User ID</th><th>Risk Score</th><th>Requests</th><th>Signals</th><th>Recommendation</th><th>Slowdown</th></tr></thead><tbody>'+r.users.map(function(u){var score=Math.round(u.risk_score||0);var cls=score>=70?"var(--red)":score>=40?"var(--yellow)":"var(--accent)";return'<tr style="border-top:1px solid var(--border)"><td style="padding:6px 0" class="mono">'+esc(u.user_id||"")+'</td><td style="padding:6px 0;color:'+cls+';font-weight:600">'+score+'</td><td style="padding:6px 0">'+(u.total_requests||0)+'</td><td style="padding:6px 0;color:var(--text2)">'+((u.signals||[]).join(", ")||"—")+'</td><td style="padding:6px 0"><span class="cb-badge '+(u.recommendation==="allow"?"cb-closed":u.recommendation==="flag"?"cb-halfopen":u.recommendation==="slowdown"?"cb-open":"cb-closed")+'">'+esc(u.recommendation||"")+'</span></td><td style="padding:6px 0">'+((u.slowdown_multiplier||1)>=1?"none":"<span style=\'color:var(--yellow)\'>"+Math.round((1/u.slowdown_multiplier))+"x</span>")+'</td></tr>';}).join("")+'</tbody></table>';}catch(e){document.getElementById("dist-high-risk-list").innerHTML='<div class="alert-error">Error: '+esc(e.message)+'</div>';}}
+async function checkDistillation(){var userId=document.getElementById("dist-user").value.trim()||"test-user";var prompt=document.getElementById("dist-prompt").value.trim();if(!prompt){document.getElementById("dist-check-result").innerHTML='<div class="alert-error">Enter a prompt to check.</div>';return;}try{var r=await apiPost("/distillation/check",{user_id:userId,prompt:prompt,tokens:parseInt(document.getElementById("dist-tokens").value)||0,is_paid_tier:document.getElementById("dist-paid").checked,is_authenticated:document.getElementById("dist-auth").checked});var score=Math.round(r.risk_score||0);var cls=score>=70?"var(--red)":score>=40?"var(--yellow)":"var(--accent)";var out='<div style="margin-bottom:8px">Risk Score: <span style="color:'+cls+';font-size:18px;font-weight:700">'+score+'</span> / 100 &nbsp; <span class="cb-badge '+(r.recommendation==="allow"?"cb-closed":r.recommendation==="flag"?"cb-halfopen":r.recommendation==="slowdown"?"cb-open":"cb-closed")+'">'+esc(r.recommendation||"")+'</span> &nbsp; Slowdown: <strong>'+r.slowdown_multiplier+'x</strong></div>';out+='<div style="margin-bottom:8px">Confidence: <strong>'+Math.round((r.confidence||0)*100)+'%</strong></div>';if(r.signals&&r.signals.length)out+='<div style="margin-bottom:8px">Signals: '+r.signals.map(function(s){return'<span style="background:rgba(248,113,113,0.15);color:var(--red);padding:2px 6px;border-radius:4px;margin-right:4px;font-size:12px">'+esc(s)+'</span>';}).join("")+'</div>';else out+='<div style="margin-bottom:8px;color:var(--text2)">No signals triggered.</div>';out+='<div style="margin-top:8px;font-size:11px;color:var(--text3)">Extraction: '+(r.is_extraction_pattern?"<span style=\'color:var(--red)\'>Y</span>":"<span style=\'color:var(--text3)\'>N</span>")+' &nbsp; High Vol: '+(r.is_high_volume?"<span style=\'color:var(--red)\'>Y</span>":"<span style=\'color:var(--text3)\'>N</span>")+' &nbsp; Systematic: '+(r.is_systematic?"<span style=\'color:var(--red)\'>Y</span>":"<span style=\'color:var(--text3)\'>N</span>")+' &nbsp; Legitimate: '+(r.is_legitimate_context?"<span style=\'color:var(--accent)\'>Y</span>":"<span style=\'color:var(--text3)\'>N</span>")+'</div>';document.getElementById("dist-check-result").innerHTML=out;}catch(e){document.getElementById("dist-check-result").innerHTML='<div class="alert-error">Error: '+esc(e.message)+'</div>';}}
+async function lookupDistillationUser(){var uid=document.getElementById("dist-lookup-user").value.trim();if(!uid){document.getElementById("dist-user-result").innerHTML='<div class="alert-error">Enter a user ID.</div>';return;}try{var r=await apiGet("/distillation/users/"+encodeURIComponent(uid));var score=Math.round(r.risk_score||0);var cls=score>=70?"var(--red)":score>=40?"var(--yellow)":"var(--accent)";document.getElementById("dist-user-result").innerHTML='<div style="margin-bottom:8px">Risk: <span style="color:'+cls+';font-weight:700">'+score+'</span>/100 &nbsp; Rec: <strong>'+esc(r.recommendation||"")+'</strong></div><div style="font-size:12px;color:var(--text2);display:grid;grid-template-columns:1fr 1fr;gap:4px"><div>Requests: <strong>'+r.total_requests+'</strong></div><div>Rate: <strong>'+r.requests_per_hour+'</strong>/hr</div><div>Unique ratio: <strong>'+r.unique_ratio+'</strong></div><div>Similarity: <strong>'+r.recent_similarity+'</strong></div><div>Extraction hits: <strong>'+r.extraction_hits+'</strong></div><div>Legitimate hits: <strong>'+r.legitimate_hits+'</strong></div></div>';}catch(e){document.getElementById("dist-user-result").innerHTML='<div class="alert-error">'+esc(e.message)+'</div>';}}
+async function resetDistillationUser(){var uid=document.getElementById("dist-lookup-user").value.trim();if(!uid)return;if(!confirm("Reset metrics for user \""+uid+"\"?"))return;try{await apiPost("/distillation/users/"+encodeURIComponent(uid)+"/reset",{});document.getElementById("dist-user-result").innerHTML='<div class="alert-success">Metrics reset for '+esc(uid)+'</div>';loadDistillationStats();}catch(e){document.getElementById("dist-user-result").innerHTML='<div class="alert-error">'+esc(e.message)+'</div>';}}
+
 </script>
 </body>
 </html>
@@ -1217,6 +1330,7 @@ window.onload=function(){checkAuth();};
 _api_key_store = None
 _budget_alert_store = None
 _guardrails_instance = None
+_distillation_detector = None
 
 
 def _get_api_key_store():
@@ -1253,6 +1367,18 @@ def _get_guardrails():
         cfg = GuardrailConfig(blocked_terms=blocked_terms, max_length=max_len)
         _guardrails_instance = Guardrails(cfg)
     return _guardrails_instance
+
+
+def _get_distillation():
+    """Returns the global DistillationDetector instance."""
+    global _distillation_detector
+    if _distillation_detector is None:
+        _distillation_detector = DistillationDetector(
+            high_risk_score=70,
+            medium_risk_score=40,
+            volume_threshold_per_hour=50,
+        )
+    return _distillation_detector
 
 
 def _get_guardrails_from_request(data: dict) -> Guardrails:
