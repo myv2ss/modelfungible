@@ -47,7 +47,9 @@ except ImportError:
     from enterprise.compliance_engine import ComplianceEngine
     from enterprise.guardrails import Guardrails, GuardrailConfig, build_guardrails_from_dict
     from enterprise.distillation_detector import DistillationDetector
+    from enterprise.byok import BYOKStore
     from enterprise.distillation_detector import DistillationDetector
+    from enterprise.byok import BYOKStore
     from enterprise.api_keys import APIKeyStore
     from enterprise.budget_alerts import BudgetAlertStore
     from enterprise.execute_integration import execute_with_cache_and_compliance, create_streaming_response
@@ -554,6 +556,137 @@ def api_distillation_check(data: dict, ctx: AuthContext=require_auth()):
     return JSONResponse(result.to_dict())
 
 
+# ─── BYOK (Bring Your Own Key) ───────────────────────────────────────────────
+
+@app.get("/api/byok/keys")
+def api_byok_keys(team_id: Optional[str]=None, include_inactive: bool=False, ctx: AuthContext=require_admin()):
+    """List all BYOK keys (admin only)."""
+    store = _get_byok()
+    keys = store.list_keys(team_id=team_id, include_inactive=include_inactive)
+    return JSONResponse({
+        "keys": [{
+            "key_id": k.key_id,
+            "team_id": k.team_id,
+            "provider": k.provider,
+            "name": k.name,
+            "upstream_key_id": k.upstream_key_id,
+            "is_active": k.is_active,
+            "created_at": k.created_at.isoformat() if k.created_at else None,
+            "last_used": k.last_used.isoformat() if k.last_used else None,
+            "error_count": k.error_count,
+            "last_error": k.last_error,
+            "owner_email": k.owner_email,
+        } for k in keys]
+    })
+
+
+@app.get("/api/byok/stats")
+def api_byok_stats(ctx: AuthContext=require_admin()):
+    """Get BYOK statistics."""
+    store = _get_byok()
+    stats = store.get_stats()
+    return JSONResponse({
+        "total_keys": stats.total_keys,
+        "active_keys": stats.active_keys,
+        "revoked_keys": stats.revoked_keys,
+        "teams_with_keys": stats.teams_with_keys,
+        "total_calls": stats.total_calls,
+        "total_cost_usd": round(stats.total_cost_usd, 6),
+        "errors_today": stats.errors_today,
+    })
+
+
+@app.post("/api/byok/register")
+def api_byok_register(data: dict, ctx: AuthContext=require_admin()):
+    """
+    Register a team's BYOK key. Admin only.
+    Returns the virtual key (shown ONLY once — give to the team).
+    """
+    team_id = data.get("team_id")
+    provider = data.get("provider", "openai")
+    upstream_key = data.get("upstream_key", "").strip()
+    name = data.get("name", "Unnamed Key")
+    owner_email = data.get("owner_email")
+
+    if not team_id or not upstream_key:
+        return JSONResponse({"error": "team_id and upstream_key are required"}, status_code=400)
+    if not upstream_key.startswith(("sk-", "sk-ant-", "gsk_", "key-")):
+        return JSONResponse({"error": "Invalid API key format"}, status_code=400)
+
+    store = _get_byok()
+    byok_key, virtual_key = store.register_key(
+        team_id=team_id,
+        provider=provider,
+        upstream_key=upstream_key,
+        name=name,
+        owner_email=owner_email,
+    )
+    return JSONResponse({
+        "key_id": byok_key.key_id,
+        "virtual_key": virtual_key,   # SHOW THIS ONLY ONCE to the team
+        "team_id": team_id,
+        "provider": provider,
+        "name": name,
+        "upstream_key_id": byok_key.upstream_key_id,
+        "created_at": byok_key.created_at.isoformat() if byok_key.created_at else None,
+    })
+
+
+@app.post("/api/byok/revoke/{key_id}")
+def api_byok_revoke(key_id: str, data: Optional[dict]=None, ctx: AuthContext=require_admin()):
+    """Revoke a BYOK key (provider ToS violation, team decommission, etc.)."""
+    reason = (data.get("reason") or "") if data else ""
+    store = _get_byok()
+    ok = store.revoke_key(key_id, reason=reason)
+    if not ok:
+        return JSONResponse({"error": "Key not found"}, status_code=404)
+    return JSONResponse({"ok": True, "key_id": key_id, "revoked": True})
+
+
+@app.post("/api/byok/reactivate/{key_id}")
+def api_byok_reactivate(key_id: str, ctx: AuthContext=require_admin()):
+    """Reactivate a revoked BYOK key."""
+    store = _get_byok()
+    ok = store.reactivate_key(key_id)
+    if not ok:
+        return JSONResponse({"error": "Key not found"}, status_code=404)
+    return JSONResponse({"ok": True, "key_id": key_id, "reactivated": True})
+
+
+@app.get("/api/byok/usage/{key_id}")
+def api_byok_usage(key_id: str, limit: int=100, ctx: AuthContext=require_admin()):
+    """Get usage records for a BYOK key."""
+    store = _get_byok()
+    records = store.get_usage(byok_key_id=key_id, limit=limit)
+    return JSONResponse({
+        "records": [{
+            "byok_key_id": r.byok_key_id,
+            "team_id": r.team_id,
+            "provider": r.provider,
+            "model": r.model,
+            "cost_usd": round(r.cost_usd, 6),
+            "tokens_used": r.tokens_used,
+            "latency_ms": r.latency_ms,
+            "error": r.error,
+            "timestamp": r.timestamp.isoformat() if r.timestamp else None,
+        } for r in records]
+    })
+
+
+@app.get("/api/byok/resolve/{virtual_key}")
+def api_byok_resolve(virtual_key: str, ctx: AuthContext=require_trader_or_admin()):
+    """
+    Resolve a BYOK virtual key to the real upstream provider + API key.
+    This is called internally by the execute pipeline — not exposed to end users.
+    """
+    store = _get_byok()
+    result = store.get_upstream_key(virtual_key)
+    if not result:
+        return JSONResponse({"error": "Invalid or inactive BYOK key"}, status_code=401)
+    provider, upstream_key = result
+    return JSONResponse({"provider": provider, "upstream_key": upstream_key})
+
+
 HTML_UI = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -667,6 +800,7 @@ select{cursor:pointer}
     <div class="nav-item" data-tab="compliance" onclick="showTab('compliance')"><span class="icon">🛡️</span><span>Compliance</span></div>
     <div class="nav-item" data-tab="guardrails" onclick="showTab('guardrails')"><span class="icon">🔍</span><span>Guardrails</span></div>
     <div class="nav-item" data-tab="distillation" onclick="showTab('distillation')"><span class="icon">🔬</span><span>Distillation</span></div>
+    <div class="nav-item" data-tab="byok" onclick="showTab('byok')"><span class="icon">🔑</span><span>BYOK</span></div>
     <div class="nav-item" data-tab="apikeys" onclick="showTab('apikeys')"><span class="icon">🔑</span><span>API Keys</span></div>
     <div class="nav-item" data-tab="budget" onclick="showTab('budget')"><span class="icon">💰</span><span>Budget</span></div>
     <div class="nav-item" data-tab="usage" onclick="showTab('usage')"><span class="icon">📈</span><span>Usage</span></div>
@@ -957,6 +1091,62 @@ select{cursor:pointer}
   </div>
 </div>
 
+<!-- BYOK Tab -->
+<div class="tab" id="tab-byok">
+  <div class="topbar"><h2>Bring Your Own Key</h2></div>
+  <div class="card">
+    <h3>Overview</h3>
+    <div id="byokStats" style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:8px">
+      <div class="stat-box"><div class="stat-num" id="byok-total">-</div><div class="stat-label">Total Keys</div></div>
+      <div class="stat-box"><div class="stat-num" id="byok-active">-</div><div class="stat-label">Active</div></div>
+      <div class="stat-box"><div class="stat-num" id="byok-revoked">-</div><div class="stat-label">Revoked</div></div>
+      <div class="stat-box"><div class="stat-num" id="byok-cost">-</div><div class="stat-label">Total Cost</div></div>
+    </div>
+    <button class="btn btn-primary" onclick="loadByokStats()">Refresh</button>
+  </div>
+  <div class="card">
+    <h3>Register Team Key</h3>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:8px">
+      <input id="byok-team" placeholder="Team ID" style="background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px">
+      <input id="byok-name" placeholder="Key name (e.g. Marketing OpenAI)" style="background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px">
+      <select id="byok-provider" style="background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px">
+        <option value="openai">OpenAI</option>
+        <option value="anthropic">Anthropic</option>
+        <option value="groq">Groq</option>
+        <option value="azure">Azure OpenAI</option>
+        <option value="vertexai">Vertex AI</option>
+      </select>
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:8px">
+      <input id="byok-key" placeholder="Paste upstream API key (sk-...)" style="flex:1;background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px;font-family:monospace">
+      <input id="byok-email" placeholder="Owner email (optional)" style="width:220px;background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px">
+    </div>
+    <div id="byok-register-msg" style="margin-bottom:8px;font-size:13px"></div>
+    <button class="btn btn-primary" onclick="registerByokKey()">Register Key</button>
+    <div id="byok-new-key" style="margin-top:12px;display:none">
+      <div class="alert-success" style="margin-bottom:8px">Key registered! Copy this virtual key now — it will not be shown again:</div>
+      <input id="byok-vkey" readonly onclick="this.select()" style="width:100%;background:var(--input-bg);color:var(--accent);border:1px solid var(--accent);border-radius:6px;padding:8px;font-family:monospace;font-size:13px">
+    </div>
+  </div>
+  <div class="card">
+    <h3>Registered Keys</h3>
+    <div style="margin-bottom:8px;font-size:13px;color:var(--text2)">
+      Show inactive: <input type="checkbox" id="byok-show-inactive" onchange="loadByokKeys()">
+    </div>
+    <div id="byok-keys-list">Loading...</div>
+  </div>
+  <div class="card">
+    <h3>Key Lookup</h3>
+    <div style="display:flex;gap:8px;margin-bottom:8px">
+      <input id="byok-lookup-key" placeholder="BYOK key ID (ritabk_xxx)" style="flex:1;background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px">
+      <button class="btn btn-primary" onclick="lookupByokKey()">Lookup</button>
+      <button class="btn btn-danger" onclick="revokeByokKey()">Revoke</button>
+      <button class="btn btn-secondary" onclick="reactivateByokKey()">Reactivate</button>
+    </div>
+    <div id="byok-lookup-result" style="font-family:monospace;font-size:12px;white-space:pre-wrap;background:var(--input-bg);border:1px solid var(--border);border-radius:6px;padding:10px;min-height:80px;color:var(--text)"></div>
+  </div>
+</div>
+
 <!-- API Keys Tab -->
 <div class="tab" id="tab-apikeys">
   <div class="topbar"><h2>Per-Team API Keys</h2></div>
@@ -1142,7 +1332,7 @@ function hlJson(obj){var s=JSON.stringify(obj,null,2);return s.replace(/("([^"]*
 function showTab(id){document.querySelectorAll(".tab").forEach(function(t){t.classList.remove("active");});document.querySelectorAll(".nav-item").forEach(function(n){n.classList.remove("active");});document.getElementById("tab-"+id).classList.add("active");document.querySelectorAll(".nav-item").forEach(function(n){if(n.dataset.tab===id)n.classList.add("active");});if(id==="dashboard")loadDashboard();else if(id==="strategies")loadStrats();
   else if(id==="decisions"){loadDecisions(0);loadDecStats();}
   else if(id==="prompts"){loadPrompts(0);}
-  else if(id==="execute")initExecute();else if(id==="audit")loadAudit(0);else if(id==="compliance")loadCompliance();else if(id==="deployments")loadDeployments();else if(id==="guardrails"){}else if(id==="distillation"){loadDistillationStats();}else if(id==="apikeys"){loadTeams();loadApiKeys();}else if(id==="budget"){loadTeamsForBudget();loadAlerts();loadAlertEvents();}else if(id==="usage"){loadUsage();loadTeamsForUsage();}}
+  else if(id==="execute")initExecute();else if(id==="audit")loadAudit(0);else if(id==="compliance")loadCompliance();else if(id==="deployments")loadDeployments();else if(id==="guardrails"){}else if(id==="distillation"){loadDistillationStats();}else if(id==="byok"){loadByokKeys();loadByokStats();}else if(id==="apikeys"){loadTeams();loadApiKeys();}else if(id==="budget"){loadTeamsForBudget();loadAlerts();loadAlertEvents();}else if(id==="usage"){loadUsage();loadTeamsForUsage();}}
 async function loadDashboard(){try{var s=await apiGet("/state");var b=await apiGet("/circuit-breakers");document.getElementById("s-total").textContent=s.total_entries||0;document.getElementById("s-today").textContent=s.entries_today||0;document.getElementById("s-models").textContent=s.models?s.models.length:0;document.getElementById("s-breakers").textContent=b.length;try{var v=await apiGet("/audit/verify");var ib=document.getElementById("integrityBadge");ib.className="badge "+(v.valid?"badge-green":"badge-red");ib.textContent=v.valid?"VERIFIED":"TAMPERED";}catch(e){}var mg=document.getElementById("mHealth");document.getElementById("noModels").style.display=(s.models&&s.models.length)?"none":"block";mg.innerHTML="";if(s.models){s.models.forEach(function(m){var n=esc(m.name).replace(/'/g,"\\'");mg.innerHTML+='<div class="model-card"><div class="name">'+esc(m.name)+'</div><div class="meta">'+esc(m.provider)+' / '+esc(m.model_id)+'</div><div class="meta">p50: '+(m.latency_ms_p50||"?")+'ms</div><div class="meta">'+esc(m.capability||"any")+'</div><div class="actions"><button class="btn btn-ghost btn-sm" onclick="testModel(\''+n+'\')">Test</button> <button class="btn btn-danger btn-sm" onclick="deleteModel(\''+n+'\')">Delete</button></div></div>';});}var ct=document.getElementById("cbTable");if(!b.length)ct.innerHTML='<div class="empty">No circuit breakers active.</div>';else{ct.innerHTML='<table><thead><tr><th>Name</th><th>State</th><th>Failures</th><th>Cooldown</th><th></th></tr></thead><tbody>'+b.map(function(x){var n=esc(x.name).replace(/'/g,"\\'");return'<tr><td class="mono">'+esc(x.name)+'</td><td><span class="cb-badge cb-'+(x.state||"CLOSED").toLowerCase().replace("-","")+'">'+esc(x.state||"CLOSED")+'</span></td><td>'+(x.failure_count||0)+'</td><td>'+(x.cooldown_seconds||60)+'s</td><td><button class="btn btn-ghost btn-sm" onclick="resetCb(\''+n+'\')">Reset</button></td></tr>';}).join("")+'</tbody></table>';}try{var logs=await get("/audit/logs?limit=10");var feed=document.getElementById("feed");feed.innerHTML=logs.length?logs.map(function(e){var cls=e.outcome==="success"?"badge-green":e.outcome==="failure"?"badge-red":"badge-yellow";return'<div class="feed-item"><span class="feed-time">'+fmtTs(e.timestamp)+'</span><span class="feed-action">'+esc(e.action)+'</span><span class="feed-actor">'+esc(e.actor||"")+'</span><span class="badge '+cls+'" style="font-size:11px">'+esc(e.outcome||"")+'</span></div>';}).join(""):'<div class="empty">No audit entries yet.</div>';}catch(e){document.getElementById("feed").innerHTML='<div class="empty">Could not load feed.</div>';}}catch(e){console.error(e);}apiGet("/api/version").then(function(v){document.getElementById("verInfo").textContent="v"+(v.modelfungible||"?")+" | Python "+(v.python||"?");}).catch(function(){document.getElementById("verInfo").textContent="ModelFungible Admin";});}
 function onProviderChange(){document.getElementById("baseUrlField").style.display=document.getElementById("mProv").value==="custom"?"block":"none";}
 function showAddProvForm(){document.getElementById("provForm").style.display="block";document.getElementById("provErr").style.display="none";document.getElementById("provSuccess").style.display="none";}
@@ -1321,6 +1511,13 @@ async function checkDistillation(){var userId=document.getElementById("dist-user
 async function lookupDistillationUser(){var uid=document.getElementById("dist-lookup-user").value.trim();if(!uid){document.getElementById("dist-user-result").innerHTML='<div class="alert-error">Enter a user ID.</div>';return;}try{var r=await apiGet("/distillation/users/"+encodeURIComponent(uid));var score=Math.round(r.risk_score||0);var cls=score>=70?"var(--red)":score>=40?"var(--yellow)":"var(--accent)";document.getElementById("dist-user-result").innerHTML='<div style="margin-bottom:8px">Risk: <span style="color:'+cls+';font-weight:700">'+score+'</span>/100 &nbsp; Rec: <strong>'+esc(r.recommendation||"")+'</strong></div><div style="font-size:12px;color:var(--text2);display:grid;grid-template-columns:1fr 1fr;gap:4px"><div>Requests: <strong>'+r.total_requests+'</strong></div><div>Rate: <strong>'+r.requests_per_hour+'</strong>/hr</div><div>Unique ratio: <strong>'+r.unique_ratio+'</strong></div><div>Similarity: <strong>'+r.recent_similarity+'</strong></div><div>Extraction hits: <strong>'+r.extraction_hits+'</strong></div><div>Legitimate hits: <strong>'+r.legitimate_hits+'</strong></div></div>';}catch(e){document.getElementById("dist-user-result").innerHTML='<div class="alert-error">'+esc(e.message)+'</div>';}}
 async function resetDistillationUser(){var uid=document.getElementById("dist-lookup-user").value.trim();if(!uid)return;if(!confirm("Reset metrics for user \""+uid+"\"?"))return;try{await apiPost("/distillation/users/"+encodeURIComponent(uid)+"/reset",{});document.getElementById("dist-user-result").innerHTML='<div class="alert-success">Metrics reset for '+esc(uid)+'</div>';loadDistillationStats();}catch(e){document.getElementById("dist-user-result").innerHTML='<div class="alert-error">'+esc(e.message)+'</div>';}}
 
+async function loadByokStats(){try{var r=await apiGet("/byok/stats");document.getElementById("byok-total").textContent=r.total_keys||0;document.getElementById("byok-active").textContent=r.active_keys||0;document.getElementById("byok-revoked").textContent=r.revoked_keys||0;document.getElementById("byok-cost").textContent="$"+(r.total_cost_usd||0).toFixed(4);}catch(e){console.error(e);}}
+async function loadByokKeys(){try{var inc=document.getElementById("byok-show-inactive").checked;var r=await apiGet("/byok/keys?include_inactive="+inc);var el=document.getElementById("byok-keys-list");if(!r.keys||!r.keys.length){el.innerHTML='<div class="empty">No BYOK keys registered.</div>';return;}el.innerHTML='<table style="width:100%;font-size:13px"><thead><tr style="text-align:left;color:var(--text2);font-size:11px;text-transform:uppercase"><th>Key ID</th><th>Team</th><th>Provider</th><th>Name</th><th>Upstream Key</th><th>Active</th><th>Errors</th><th>Last Used</th></tr></thead><tbody>'+r.keys.map(function(k){return'<tr style="border-top:1px solid var(--border)"><td style="padding:6px 0" class="mono">'+esc(k.key_id)+'</td><td style="padding:6px 0">'+esc(k.team_id)+'</td><td style="padding:6px 0">'+esc(k.provider)+'</td><td style="padding:6px 0">'+esc(k.name)+'</td><td style="padding:6px 0;color:var(--text3);font-family:monospace;font-size:11px">'+esc(k.upstream_key_id)+'</td><td style="padding:6px 0">'+(k.is_active?'<span class="cb-badge cb-closed">Active</span>':'<span class="cb-badge cb-open">Revoked</span>')+'</td><td style="padding:6px 0">'+(k.error_count||0)+'</td><td style="padding:6px 0;color:var(--text3)">'+(k.last_used?esc(k.last_used):"—")+'</td></tr>';}).join("")+'</tbody></table>';}catch(e){document.getElementById("byok-keys-list").innerHTML='<div class="ebox">'+esc(e.message)+'</div>';}}
+async function registerByokKey(){var team=document.getElementById("byok-team").value.trim();var name=document.getElementById("byok-name").value.trim();var provider=document.getElementById("byok-provider").value;var key=document.getElementById("byok-key").value.trim();var email=document.getElementById("byok-email").value.trim();if(!team||!key){document.getElementById("byok-register-msg").innerHTML='<div class="alert-error">Team ID and upstream key are required.</div>';return;}try{var r=await apiPost("/byok/register",{team_id:team,provider:provider,upstream_key:key,name:name,owner_email:email||null});document.getElementById("byok-register-msg").innerHTML='<div class="alert-success">Key registered for team '+esc(team)+'</div>';document.getElementById("byok-vkey").value=r.virtual_key;document.getElementById("byok-new-key").style.display="block";document.getElementById("byok-key").value="";loadByokKeys();loadByokStats();}catch(e){document.getElementById("byok-register-msg").innerHTML='<div class="alert-error">'+esc(e.message)+'</div>';}}
+async function lookupByokKey(){var kid=document.getElementById("byok-lookup-key").value.trim();if(!kid){document.getElementById("byok-lookup-result").innerHTML='<div class="alert-error">Enter a key ID.</div>';return;}try{var r=await apiGet("/byok/keys?include_inactive=true");var k=(r.keys||[]).find(function(x){return x.key_id===kid;});if(!k){document.getElementById("byok-lookup-result").innerHTML='<div class="alert-error">Key not found.</div>';return;}document.getElementById("byok-lookup-result").innerHTML='Key: '+esc(k.key_id)+'\nTeam: '+esc(k.team_id)+'\nProvider: '+esc(k.provider)+'\nName: '+esc(k.name)+'\nUpstream: '+esc(k.upstream_key_id)+'\nStatus: '+(k.is_active?'Active':'Revoked')+'\nErrors: '+k.error_count+'\nLast Used: '+(k.last_used||'never')+'\nLast Error: '+(k.last_error||'none')+'\nOwner: '+(k.owner_email||"—");}catch(e){document.getElementById("byok-lookup-result").innerHTML='<div class="alert-error">'+esc(e.message)+'</div>';}}
+async function revokeByokKey(){var kid=document.getElementById("byok-lookup-key").value.trim();if(!kid)return;if(!confirm("Revoke BYOK key \""+kid+"\"?"))return;try{await apiPost("/byok/revoke/"+encodeURIComponent(kid),{});document.getElementById("byok-lookup-result").innerHTML='<div class="alert-success">Key revoked: '+esc(kid)+'</div>';loadByokKeys();loadByokStats();}catch(e){document.getElementById("byok-lookup-result").innerHTML='<div class="alert-error">'+esc(e.message)+'</div>';}}
+async function reactivateByokKey(){var kid=document.getElementById("byok-lookup-key").value.trim();if(!kid)return;try{await apiPost("/byok/reactivate/"+encodeURIComponent(kid),{});document.getElementById("byok-lookup-result").innerHTML='<div class="alert-success">Key reactivated: '+esc(kid)+'</div>';loadByokKeys();loadByokStats();}catch(e){document.getElementById("byok-lookup-result").innerHTML='<div class="alert-error">'+esc(e.message)+'</div>';}}
+
 </script>
 </body>
 </html>
@@ -1331,6 +1528,7 @@ _api_key_store = None
 _budget_alert_store = None
 _guardrails_instance = None
 _distillation_detector = None
+_byok_store = None
 
 
 def _get_api_key_store():
@@ -1379,6 +1577,15 @@ def _get_distillation():
             volume_threshold_per_hour=50,
         )
     return _distillation_detector
+
+
+def _get_byok():
+    """Returns the global BYOK store."""
+    global _byok_store
+    if _byok_store is None:
+        db_path = os.environ.get("MODELFUNGIBLE_BYOK_DB", ".modelfungible/byok.db")
+        _byok_store = BYOKStore(db_path)
+    return _byok_store
 
 
 def _get_guardrails_from_request(data: dict) -> Guardrails:
