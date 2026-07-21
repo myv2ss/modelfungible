@@ -4,6 +4,7 @@ import sys
 sys.path.insert(0, '.')
 
 import time
+import json
 import pytest
 from enterprise.traffic_obfuscator import (
     TrafficObfuscator,
@@ -140,6 +141,57 @@ class TestProxyManagement:
         assert "http://proxy:8080" in obf.proxies
         obf.remove_proxy("http://proxy:8080")
         assert "http://proxy:8080" not in obf.proxies
+
+
+class TestEndUserForwarding:
+    def test_apply_adds_user_field_to_body(self):
+        obf = TrafficObfuscator(upstream_api_key="sk-test", provider="openai")
+        kwargs = {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}
+        result = obf.apply(kwargs, end_user_id="user_abc123")
+        assert result["json"]["user"] == "user_abc123"
+
+    def test_apply_does_not_mutate_original(self):
+        obf = TrafficObfuscator(upstream_api_key="sk-test", provider="openai")
+        original = {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}
+        original_model = original["model"]
+        original_messages = original["messages"]
+        obf.apply(original, end_user_id="user_abc")
+        # existing keys must not be mutated
+        assert original["model"] == original_model
+        assert original["messages"] == original_messages
+
+    def test_apply_adds_user_headers(self):
+        obf = TrafficObfuscator(upstream_api_key="sk-test", provider="openai")
+        kwargs = {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}
+        result = obf.apply(kwargs, end_user_id="user_xyz")
+        h = result["headers"]
+        assert "X-User-ID" in h
+        assert "OpenAI-User-ID" in h
+        assert "Citadel-User-ID" in h
+        assert h["X-User-ID"] == "user_xyz"
+        assert h["OpenAI-User-ID"] == "user_xyz"
+
+    def test_headers_origin_referer_match_same_app(self):
+        obf = TrafficObfuscator(upstream_api_key="sk-test", provider="openai")
+        kwargs = {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}
+        result = obf.apply(kwargs, end_user_id="user_abc", user_id="user_abc")
+        h = result["headers"]
+        origin = h["Origin"]
+        referer = h["Referer"]
+        # Extract domain from Origin and check Referer starts with same domain
+        origin_domain = "/".join(origin.split("/")[:3])
+        assert referer.startswith(origin_domain)
+
+    def test_get_request_headers_accepts_user_id(self):
+        obf = TrafficObfuscator(upstream_api_key="sk-test", provider="openai")
+        h1 = obf.get_request_headers(user_id="alice")
+        h2 = obf.get_request_headers(user_id="alice")
+        # Same user_id = same Origin/Referer
+        assert h1["Origin"] == h2["Origin"]
+        assert h1["Referer"] == h2["Referer"]
+        # Different user = different Origin/Referer (use very different IDs to avoid hash collision)
+        h3 = obf.get_request_headers(user_id="user_000000000001")
+        assert h1["Origin"] != h3["Origin"]
 
 
 class TestFullApply:
