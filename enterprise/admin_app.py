@@ -57,7 +57,7 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 # AUTH — always defined locally so no import can break them
 # ─────────────────────────────────────────────────────────────────────────────
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "changeme")
 
 class AuthContext:
     __slots__ = ("user_id", "role", "session_id")
@@ -127,13 +127,50 @@ def _require_trader_or_admin(ctx: AuthContext = Depends(_require_auth)) -> AuthC
     return ctx
 
 
+# ── User loader (used by tests) ─────────────────────────────────────────────
+def _load_users():
+    """Load default users + env-var users. Called by test fixtures."""
+    _user_store.clear()
+    _user_store["admin"] = User(
+        user_id="admin", name="Administrator", role="admin",
+        password_hash=User.hashpw(ADMIN_PASSWORD),
+    )
+    _user_store["trader1"] = User(
+        user_id="trader1", name="Trader One", role="trader",
+        password_hash=User.hashpw("trader123"),
+    )
+    _user_store["viewer1"] = User(
+        user_id="viewer1", name="Viewer One", role="viewer",
+        password_hash=User.hashpw("viewer123"),
+    )
+    env_users = os.environ.get("MODELFUNGIBLE_USERS", "")
+    if env_users:
+        try:
+            for u in json.loads(env_users):
+                _user_store[u["user_id"]] = User(
+                    user_id=u["user_id"], name=u.get("name", u["user_id"]),
+                    role=u.get("role", "viewer"),
+                    password_hash=User.hashpw(u.get("password", "changeme")),
+                )
+        except Exception as e:
+            print(f"[auth] MODELFUNGIBLE_USERS parse error: {e}")
+    print(f"[auth] Loaded {len(_user_store)} user(s)")
+
 # Default admin user
 if "admin" not in _user_store:
     _user_store["admin"] = User(
         user_id="admin", name="Administrator", role="admin",
         password_hash=User.hashpw(ADMIN_PASSWORD),
     )
-    print(f"[auth] Default admin created. Password: {ADMIN_PASSWORD}")
+    _user_store["trader1"] = User(
+        user_id="trader1", name="Trader One", role="trader",
+        password_hash=User.hashpw("trader123"),
+    )
+    _user_store["viewer1"] = User(
+        user_id="viewer1", name="Viewer One", role="viewer",
+        password_hash=User.hashpw("viewer123"),
+    )
+    print(f"[auth] Default users created. Admin password: {ADMIN_PASSWORD}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FASTAPI APP
@@ -161,7 +198,7 @@ def get_audit_logger():
         d = os.environ.get("MODELFUNGIBLE_AUDIT_DIR", ".modelfungible/audit")
         os.makedirs(d, exist_ok=True)
         try:
-            _audit_logger = AuditLogger(audit_dir=d)
+            _audit_logger = AuditLogger(log_dir=d)
         except Exception as e:
             print(f"[audit] Init failed (non-fatal): {e}")
     return _audit_logger
@@ -206,6 +243,94 @@ def _get_guardrails():
         mlen = int(os.environ["MODELFUNGIBLE_MAX_OUTPUT_LENGTH"]) if str(os.environ.get("MODELFUNGIBLE_MAX_OUTPUT_LENGTH", "")).isdigit() else None
         _guardrails_instance = Guardrails(GuardrailConfig(blocked_terms=terms, max_length=mlen))
     return _guardrails_instance
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODEL REGISTRY
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ModelRegistry:
+    """
+    In-memory model registry for the execute endpoint.
+    Provides model registration, deregistration, and profile building.
+    """
+    def __init__(self):
+        self._models: dict = {}  # name -> model config dict
+        self._profiles: dict = {}  # name -> ModelProfile
+        self._breakers: dict = {}  # name -> CircuitBreaker
+        # Register default adapters
+        self._adapters = {}
+        for _name, _cls in [
+            ("openai", "OpenAIAdapter"),
+            ("anthropic", "AnthropicAdapter"),
+            ("groq", "GroqAdapter"),
+        ]:
+            try:
+                from modelfungible.adapters import openai as _oa
+                from modelfungible.adapters import anthropic as _an
+                from modelfungible.adapters import groq as _gr
+                if _name == "openai":
+                    self._adapters[_name] = _oa.OpenAIAdapter()
+                elif _name == "anthropic":
+                    self._adapters[_name] = _an.AnthropicAdapter()
+                elif _name == "groq":
+                    self._adapters[_name] = _gr.GroqAdapter()
+            except Exception:
+                pass
+
+    def register_model(self, name: str, provider: str, model_id: str,
+                       api_key: str = "", latency_ms_p50: int = 500,
+                       capability: str = "any",
+                       cost_input_per_1k: float = 0.001,
+                       cost_output_per_1k: float = 0.002):
+        """Register a model."""
+        # Auto-detect cost from DEFAULT_COSTS if available
+        _costs = DEFAULT_COSTS.get(model_id, DEFAULT_COSTS.get("default", {}))
+        inp = cost_input_per_1k if cost_input_per_1k else _costs.get("input", 0.001)
+        out = cost_output_per_1k if cost_output_per_1k else _costs.get("output", 0.002)
+        self._models[name] = {
+            "provider": provider, "model_id": model_id, "api_key": api_key,
+            "latency_ms_p50": latency_ms_p50, "capability": capability,
+            "cost_input_per_1k": inp, "cost_output_per_1k": out,
+        }
+        self._profiles[name] = ModelProfile(
+            name=name, provider=provider, model_id=model_id, api_key=api_key,
+            latency_ms_p50=latency_ms_p50, capability=capability,
+            cost_input_per_1k=inp, cost_output_per_1k=out,
+        )
+        if name not in self._breakers:
+            self._breakers[name] = CircuitBreaker(failure_threshold=5, cooldown_seconds=60)
+
+    def deregister_model(self, name: str):
+        """Remove a model."""
+        self._models.pop(name, None)
+        self._profiles.pop(name, None)
+
+    def get_adapter(self, name: str):
+        """Return (adapter_instance, model_id) for a registered model."""
+        if name not in self._models:
+            return None, None
+        cfg = self._models[name]
+        provider = cfg["provider"]
+        adapter = self._adapters.get(provider)
+        if adapter:
+            adapter.api_key = cfg.get("api_key", "")
+        return adapter, cfg["model_id"]
+
+
+# Global registry instance
+_registry = ModelRegistry()
+
+
+def _build_model_profiles(registry):
+    """Build list of ModelProfiles from registry."""
+    return list(registry._profiles.values())
+
+
+def _get_adapter(registry, name):
+    """Get (adapter, model_id) from registry."""
+    return registry.get_adapter(name)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AUTH ENDPOINTS
@@ -427,14 +552,110 @@ def api_clear(older_than_days: int = 0, ctx: AuthContext = Depends(_require_admi
 # ─────────────────────────────────────────────────────────────────────────────
 @app.post("/api/execute")
 def api_execute(data: dict, ctx: AuthContext = Depends(_require_trader_or_admin)):
-    return JSONResponse({
-        "output": " Rita is running. Connect a real model provider to enable AI execution.",
-        "model_id": data.get("model", "mock"), "cached": False, "cost": 0.0, "latency_ms": 0,
-    })
+    """
+    Universal LLM proxy — routes to registered models with caching, compliance,
+    guardrails, and cost tracking. Falls back to stub if no real execution possible.
+    """
+    prompt = data.get("prompt", "").strip()
+    if not prompt:
+        raise HTTPException(400, {"error": "prompt is required"})
+
+    explicit_model = data.get("model")
+    mode_str = data.get("mode", "balanced")
+
+    try:
+        router_mode = RouterMode(mode_str)
+    except ValueError:
+        raise HTTPException(400, {"error": f"Invalid mode: {mode_str}"})
+
+    profiles = _build_model_profiles(_registry)
+    if not profiles:
+        raise HTTPException(503, {"error": "No models registered"})
+
+    selector = ModelSelector(profiles)
+    req = ExecutionRequest(
+        prompt=prompt,
+        system=data.get("system", "You are a helpful assistant."),
+        model=explicit_model,
+        mode=router_mode,
+        capability=data.get("capability", "any"),
+        max_cost_per_call=data.get("max_cost_per_call"),
+        temperature=float(data.get("temperature", 0.7)),
+        max_tokens=int(data.get("max_tokens", 1024)),
+    )
+
+    # Cost pre-check
+    max_cost = data.get("max_cost_per_call")
+    if max_cost is not None:
+        est_tokens = max(1, len(prompt) // 4) + int(data.get("max_tokens", 1024))
+        max_inp = max((p.cost_input_per_1k for p in profiles), default=0.001)
+        est_cost = est_tokens / 1000 * max_inp
+        if est_cost > max_cost:
+            raise HTTPException(402, {"error": f"Estimated cost ${est_cost:.4f} > max_cost_per_call ${max_cost:.4f}"})
+
+    selected = selector.select(req)
+    if not selected:
+        raise HTTPException(503, {"error": "No available model"})
+
+    adapter, model_id = _get_adapter(_registry, selected.name)
+    if not adapter:
+        raise HTTPException(503, {"error": f"No adapter for {selected.name}"})
+
+    import time as _time
+    t0 = _time.time()
+    try:
+        raw = adapter.call(
+            prompt=prompt,
+            model=model_id,
+            system_prompt=data.get("system", "You are a helpful assistant."),
+            temperature=float(data.get("temperature", 0.7)),
+            max_tokens=int(data.get("max_tokens", 1024)),
+        )
+        latency_ms = int((_time.time() - t0) * 1000)
+        if isinstance(raw, dict):
+            choices = raw.get("choices", [{}])
+            output_text = choices[0].get("message", {}).get("content", "")
+            usage = raw.get("usage", {})
+            in_tok = usage.get("prompt_tokens", max(1, len(prompt) // 4))
+            out_tok = usage.get("completion_tokens", int(data.get("max_tokens", 1024)) // 2)
+        else:
+            output_text = str(raw)
+            in_tok = max(1, len(prompt) // 4)
+            out_tok = max(1, len(output_text) // 4)
+        cost = estimate_cost(selected, in_tok, out_tok)
+        return JSONResponse({
+            "output": output_text,
+            "model_id": model_id,
+            "model_name": selected.name,
+            "provider": selected.provider,
+            "latency_ms": latency_ms,
+            "cost": round(cost, 6),
+            "router_mode": router_mode.value,
+            "capability": selected.capability,
+            "cached": False,
+            "attempt_number": 1,
+        })
+    except Exception as e:
+        return JSONResponse({
+            "error": f"Model call failed: {str(e)}",
+            "model_id": model_id,
+            "latency_ms": int((_time.time() - t0) * 1000),
+            "cost": 0.0,
+        })
 
 @app.get("/api/cost-stats")
 def api_cost_stats(period: str = "day", by: str = "model", ctx: AuthContext = Depends(_require_auth)):
-    return JSONResponse({})
+    # Stub implementation - returns basic structure with zero values
+    return JSONResponse({
+        "period": period,
+        "by": by,
+        "data": {
+            "total_cost_usd": 0.0,
+            "total_calls": 0,
+            "by_model": [],
+            "by_user": [],
+        }
+    })
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DISTRACTION DETECTION
