@@ -321,6 +321,29 @@ class ModelRegistry:
 # Global registry instance
 _registry = ModelRegistry()
 
+# Register free Groq models on startup if API key is available
+_groq_key = os.environ.get("GROQ_API_KEY", "")
+if _groq_key:
+    for _name, _model_id, _capability in [
+        ("groq-llama-8b",   "llama-3.1-8b-instant",    "fast"),
+        ("groq-llama-70b",  "llama-3.3-70b-versatile",  "precise"),
+        ("groq-llama-3b",  "llama-3.3-70b-versatile",  "code"),
+    ]:
+        try:
+            _registry.register_model(
+                name=_name, provider="groq", model_id=_model_id,
+                api_key=_groq_key, latency_ms_p50=800,
+                capability=_capability,
+                cost_input_per_1k=0.00005,
+                cost_output_per_1k=0.00005,
+            )
+        except Exception as e:
+            print(f"[registry] Failed to register {_name}: {e}")
+    print(f"[registry] Registered {len(_registry._models)} Groq models (free tier)")
+else:
+    print("[registry] No GROQ_API_KEY found — register models via POST /api/models/register")
+
+
 
 def _build_model_profiles(registry):
     """Build list of ModelProfiles from registry."""
@@ -405,9 +428,23 @@ def api_state(ctx: AuthContext = Depends(_require_auth)):
             verified = audit.verify_integrity()
         except Exception:
             verified = False
+    # Build models list from registry
+    models_list = []
+    for name, cfg in _registry._models.items():
+        prof = _registry._profiles.get(name, {})
+        models_list.append({
+            "name": name,
+            "provider": cfg.get("provider", ""),
+            "model_id": cfg.get("model_id", ""),
+            "cost_input_per_1k": cfg.get("cost_input_per_1k", prof.cost_input_per_1k if prof else 0.001),
+            "cost_output_per_1k": cfg.get("cost_output_per_1k", prof.cost_output_per_1k if prof else 0.002),
+            "latency_ms_p50": cfg.get("latency_ms_p50", 500),
+            "capability": cfg.get("capability", "any"),
+        })
     return JSONResponse({
         "user": {"user_id": ctx.user_id, "role": ctx.role},
-        "models": [], "strategies": [],
+        "models": models_list,
+        "strategies": [],
         "audit": {"total_entries": total, "entries_today": today_count, "hash_chain_verified": verified},
         "circuit_breakers": [],
     })
@@ -454,11 +491,42 @@ def api_audit_verify(ctx: AuthContext = Depends(_require_auth)):
 def api_model_register(data: dict, ctx: AuthContext = Depends(_require_admin)):
     name = data.get("name", "").strip()
     if not name:
-        raise HTTPException(400, {"error": "name required"})
-    return JSONResponse({"ok": True, "name": name})
+        return JSONResponse(status_code=400, content={"error": "name required"})
+    provider = data.get("provider", "")
+    model_id = data.get("model_id", "")
+    api_key = data.get("api_key", "")
+    latency_ms_p50 = int(data.get("latency_ms_p50", 500))
+    capability = data.get("capability", "any")
+    cost_input = data.get("cost_input_per_1k", 0.0)
+    cost_output = data.get("cost_output_per_1k", 0.0)
+
+    # Auto-detect cost from DEFAULT_COSTS if not provided
+    _costs = DEFAULT_COSTS.get(model_id, DEFAULT_COSTS.get("default", {}))
+    inp = cost_input if cost_input > 0 else _costs.get("input", 0.001)
+    out = cost_output if cost_output > 0 else _costs.get("output", 0.002)
+
+    _registry.register_model(
+        name=name, provider=provider, model_id=model_id, api_key=api_key,
+        latency_ms_p50=latency_ms_p50, capability=capability,
+        cost_input_per_1k=inp, cost_output_per_1k=out,
+    )
+    profile = _registry._profiles.get(name, {})
+    return JSONResponse({
+        "ok": True,
+        "model": {
+            "name": name,
+            "provider": provider,
+            "model_id": model_id,
+            "cost_input_per_1k": inp,
+            "cost_output_per_1k": out,
+            "latency_ms_p50": latency_ms_p50,
+            "capability": capability,
+        }
+    })
 
 @app.delete("/api/models/{name}")
 def api_model_delete(name: str, ctx: AuthContext = Depends(_require_admin)):
+    _registry.deregister_model(name)
     return JSONResponse({"ok": True})
 
 @app.get("/api/providers")
@@ -556,9 +624,10 @@ def api_execute(data: dict, ctx: AuthContext = Depends(_require_trader_or_admin)
     Universal LLM proxy — routes to registered models with caching, compliance,
     guardrails, and cost tracking. Falls back to stub if no real execution possible.
     """
+    import time as _time
     prompt = data.get("prompt", "").strip()
     if not prompt:
-        raise HTTPException(400, {"error": "prompt is required"})
+        return JSONResponse(status_code=400, content={"error": "prompt is required"})
 
     explicit_model = data.get("model")
     mode_str = data.get("mode", "balanced")
@@ -566,11 +635,11 @@ def api_execute(data: dict, ctx: AuthContext = Depends(_require_trader_or_admin)
     try:
         router_mode = RouterMode(mode_str)
     except ValueError:
-        raise HTTPException(400, {"error": f"Invalid mode: {mode_str}"})
+        return JSONResponse(status_code=400, content={"error": f"Invalid mode: {mode_str}"})
 
     profiles = _build_model_profiles(_registry)
     if not profiles:
-        raise HTTPException(503, {"error": "No models registered"})
+        return JSONResponse(status_code=503, content={"error": "No models registered"})
 
     selector = ModelSelector(profiles)
     req = ExecutionRequest(
@@ -591,17 +660,17 @@ def api_execute(data: dict, ctx: AuthContext = Depends(_require_trader_or_admin)
         max_inp = max((p.cost_input_per_1k for p in profiles), default=0.001)
         est_cost = est_tokens / 1000 * max_inp
         if est_cost > max_cost:
-            raise HTTPException(402, {"error": f"Estimated cost ${est_cost:.4f} > max_cost_per_call ${max_cost:.4f}"})
+            return JSONResponse(status_code=402, content={
+                "error": f"Estimated cost ${est_cost:.4f} > max_cost_per_call ${max_cost:.4f}"})
 
     selected = selector.select(req)
     if not selected:
-        raise HTTPException(503, {"error": "No available model"})
+        return JSONResponse(status_code=503, content={"error": "No available model"})
 
     adapter, model_id = _get_adapter(_registry, selected.name)
     if not adapter:
-        raise HTTPException(503, {"error": f"No adapter for {selected.name}"})
+        return JSONResponse(status_code=503, content={"error": f"No adapter for {selected.name}"})
 
-    import time as _time
     t0 = _time.time()
     try:
         raw = adapter.call(
@@ -613,11 +682,28 @@ def api_execute(data: dict, ctx: AuthContext = Depends(_require_trader_or_admin)
         )
         latency_ms = int((_time.time() - t0) * 1000)
         if isinstance(raw, dict):
+            # Handle multiple response formats:
+            # 1. OpenAI format: {"choices": [{"message": {"content": "..."}}]}
+            # 2. ParsedOutput format: {"text": "..."} with _raw and _usage attributes
+            # 3. Generic dict: {"text": "..."} or {"content": "..."}
             choices = raw.get("choices", [{}])
-            output_text = choices[0].get("message", {}).get("content", "")
-            usage = raw.get("usage", {})
-            in_tok = usage.get("prompt_tokens", max(1, len(prompt) // 4))
-            out_tok = usage.get("completion_tokens", int(data.get("max_tokens", 1024)) // 2)
+            output_text = ""
+            if choices and isinstance(choices, list):
+                output_text = choices[0].get("message", {}).get("content", "") if choices[0] else ""
+            if not output_text:
+                output_text = raw.get("text", "") or raw.get("content", "")
+            if not output_text and hasattr(raw, "_raw"):
+                output_text = raw._raw
+            if not output_text:
+                output_text = str(raw)
+            # Usage: check _usage attribute (ParsedOutput) or "usage" key (OpenAI)
+            usage = {}
+            if hasattr(raw, "_usage") and raw._usage:
+                usage = raw._usage
+            elif "usage" in raw:
+                usage = raw["usage"]
+            in_tok = usage.get("prompt_tokens", max(1, len(prompt) // 4)) if usage else max(1, len(prompt) // 4)
+            out_tok = usage.get("completion_tokens", int(data.get("max_tokens", 1024)) // 2) if usage else max(1, len(output_text) // 4)
         else:
             output_text = str(raw)
             in_tok = max(1, len(prompt) // 4)
@@ -636,7 +722,7 @@ def api_execute(data: dict, ctx: AuthContext = Depends(_require_trader_or_admin)
             "attempt_number": 1,
         })
     except Exception as e:
-        return JSONResponse({
+        return JSONResponse(status_code=503, content={
             "error": f"Model call failed: {str(e)}",
             "model_id": model_id,
             "latency_ms": int((_time.time() - t0) * 1000),
