@@ -869,26 +869,22 @@ def api_version(ctx: AuthContext = Depends(_require_auth)):
 # ─────────────────────────────────────────────────────────────────────────────
 # HTML ADMIN UI  (placeholder — the real UI is served separately)
 # ─────────────────────────────────────────────────────────────────────────────
-HTML_UI = (
-    "<!DOCTYPE html><html><head><title>Rita Gateway</title>"
-    "<meta charset=utf-8><style>"
-    "body{font-family:system-ui;background:#0f1117;color:#e5e7eb;margin:0;padding:20px}"
-    "h1{color:#60a5fa}a{color:#60a5fa;text-decoration:none}"
-    "pre{background:#1f2937;padding:12px;border-radius:6px;overflow-x:auto}"
-    ".card{background:#1f2937;border-radius:8px;padding:16px;margin:12px 0}"
-    "button{background:#60a5fa;color:#000;padding:8px 16px;border:none;border-radius:6px;cursor:pointer}"
-    "input,select{background:#374151;color:#e5e7eb;border:1px solid #4b5563;padding:8px;border-radius:4px}"
-    "</style></head><body>"
-    "<h1>Rita Gateway</h1>"
-    "<p>Admin portal running. Full UI: <code>python3 -m modelfungible.enterprise.admin_ui</code></p>"
-    '<div class="card"><h2>Quick Test</h2>'
-    "<p>Login: <code>admin</code> / <code>admin123</code></p></div>"
-    "</body></html>"
-)
+# Load full admin UI from file (served at /admin)
+_ADMIN_UI_PATH = Path(__file__).parent / "admin_ui.html"
+_ADMIN_UI_CACHE = None
+
+def _load_admin_ui():
+    global _ADMIN_UI_CACHE
+    if _ADMIN_UI_CACHE is None:
+        if _ADMIN_UI_PATH.exists():
+            _ADMIN_UI_CACHE = _ADMIN_UI_PATH.read_text(encoding="utf-8")
+        else:
+            _ADMIN_UI_CACHE = "<html><body><h1>Rita</h1><p>admin_ui.html not found. Run: python3 -m modelfungible.enterprise.admin_ui --build</p></body></html>"
+    return _ADMIN_UI_CACHE
 
 @app.get("/admin")
 def admin_root():
-    return HTMLResponse(content=HTML_UI, media_type="text/html")
+    return HTMLResponse(content=_load_admin_ui(), media_type="text/html")
 
 @app.get("/")
 def root():
