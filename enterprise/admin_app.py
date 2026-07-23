@@ -9,9 +9,10 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
-from fastapi import FastAPI, Response, HTTPException, Header, Depends, Query
+from fastapi import FastAPI, Response, HTTPException, Header, Depends, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from pydantic import BaseModel
 
 # ── Resolve import paths ───────────────────────────────────────────────────────
 for _p in [str(Path(__file__).parent), str(Path(__file__).parent.parent)]:
@@ -359,9 +360,9 @@ def _get_adapter(registry, name):
 # AUTH ENDPOINTS
 # ─────────────────────────────────────────────────────────────────────────────
 @app.post("/api/auth/login")
-def api_login(data: dict):
-    user = _user_store.get(data.get("user_id", ""))
-    if user is None or not user.check_password(data.get("password", "")):
+def api_login(user_id: str = Body(...), password: str = Body(...)):
+    user = _user_store.get(user_id)
+    if user is None or not user.check_password(password):
         raise HTTPException(401, {"error": "Invalid user_id or password"})
     sess = create_session(user)
     audit = get_audit_logger()
@@ -458,7 +459,7 @@ def api_circuit_breakers(ctx: AuthContext = Depends(_require_auth)):
     return JSONResponse([])
 
 @app.post("/api/circuit-breakers/{name}/reset")
-def api_circuit_breaker_reset(name: str):
+def api_circuit_breaker_reset(name: str, ctx: AuthContext = Depends(_require_admin)):
     return JSONResponse({"ok": True})
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -471,9 +472,9 @@ def api_audit_logs(ctx: AuthContext = Depends(_require_auth),
     outcome: Optional[str] = None, limit: int = 100, offset: int = 0):
     audit = get_audit_logger()
     if not audit:
-        return JSONResponse([])
-    return JSONResponse(audit.query(start_date=start_date, end_date=end_date,
-                                     actor=actor, action=action, outcome=outcome, limit=limit, offset=offset))
+        return JSONResponse({"entries": []})
+    return JSONResponse({"entries": audit.query(start_date=start_date, end_date=end_date,
+                                     actor=actor, action=action, outcome=outcome, limit=limit, offset=offset)})
 
 @app.get("/api/audit/export/{fmt}")
 def api_audit_export(fmt: str, ctx: AuthContext = Depends(_require_auth)):
@@ -482,7 +483,8 @@ def api_audit_export(fmt: str, ctx: AuthContext = Depends(_require_auth)):
 @app.get("/api/audit/verify")
 def api_audit_verify(ctx: AuthContext = Depends(_require_auth)):
     audit = get_audit_logger()
-    return JSONResponse({"valid": audit.verify_integrity() if audit else False})
+    integrity = audit.verify_integrity() if audit else False
+    return JSONResponse({"verified": integrity, "valid": integrity})
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MODEL REGISTRY
